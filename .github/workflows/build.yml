@@ -1,0 +1,46 @@
+name: build-cursor-sand-toolkit
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            artifact: cursor-sand-toolkit-macos-arm64
+          - os: windows-latest
+            artifact: cursor-sand-toolkit-windows-amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build single-file binary
+        run: |
+          pyinstaller --onefile --name cursor-sand-toolkit cursor-sand-toolkit.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/cursor-sand-toolkit
+            dist/cursor-sand-toolkit.exe
+          if-no-files-found: warn
