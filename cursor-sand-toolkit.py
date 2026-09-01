@@ -32,7 +32,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 TOOL_NAME = "Sand Stream Toolkit"
-TOOL_VERSION = "1.3.0"
+TOOL_VERSION = "1.4.0"
 SUPPORTED_CURSOR_VERSION = "3.18.9"
 CONFIG_VERSION = 1
 
@@ -47,6 +47,59 @@ SAND_AGENT_HOST_IDENTITY_MARKER = "/*SAND_AGENT_HOST_IDENTITY_V1*/"
 SAND_MOVE_EXEC_MARKER = "/*SAND_MOVE_EXEC_V1*/"
 MOVE_EXEC_ORIGINAL = "p=await Promise.resolve(r.cursor.checkFeatureGate(Us)).catch(()=>!1)"
 MOVE_EXEC_PATCHED = "p=!0" + SAND_MOVE_EXEC_MARKER
+# —— 子 agent（Task 工具）激活 ——
+SAND_TASK_TOOL_MARKER = "/*SAND_TASK_TOOL_V1*/"
+TASK_TOOL_ORIGINAL = "taskToolProps:void 0"
+TASK_TOOL_PATCHED = (
+    "taskToolProps:{parentRequestedModelName:i,parentModelParameters:void 0,"
+    "parentMaxMode:l,isModelBlocked:()=>!1,isModelValid:()=>!0,"
+    "requiresMaxMode:()=>!1,forceModelId:void 0,compareModelCosts:()=>0,"
+    'subagentModelForcePolicy:"none",requireServerSideSubagent:!1,'
+    "subagentModels:{modelsBySlug:new Map},subagentModelOverrides:{},"
+    "normalizeCustomSubagents:e=>e,enableGrindSwarmSubagent:!1,"
+    "enableBrowserSubagent:!1,"
+    "getTaskToolConfig:()=>async()=>({})"
+    + SAND_TASK_TOOL_MARKER
+    + "}"
+)
+SAND_CLIENT_SIDE_SUBAGENT_MARKER = "/*SAND_CLIENT_SIDE_SUBAGENT_V1*/"
+CLIENT_SIDE_SUBAGENT_ORIGINAL = (
+    "const Cre={enableEmptyResponseRetry:!0,enableGrepBroadGlobGuard:!0,"
+    "enableReadToolNegativeOffset:!0,enableSandboxSharedBuildCache:!0,"
+    "nalLoopDetection:!0}"
+)
+CLIENT_SIDE_SUBAGENT_PATCHED = (
+    "const Cre={enableEmptyResponseRetry:!0,enableGrepBroadGlobGuard:!0,"
+    "enableReadToolNegativeOffset:!0,enableSandboxSharedBuildCache:!0,"
+    "nalLoopDetection:!0,useClientSideSubagent:!0"
+    + SAND_CLIENT_SIDE_SUBAGENT_MARKER
+    + "}"
+)
+SAND_SUBAGENT_TURN_MARKER = "/*SAND_SUBAGENT_TURN_V1*/"
+SAND_SUBAGENT_FOLLOWUP_MARKER = "/*SAND_SUBAGENT_FOLLOWUP_V1*/"
+SUBAGENT_TURN_N_OLD = (
+    "hasUnsupportedRunOptions:void 0!==e.runOptions.customSystemPrompt||"
+    "void 0!==e.runOptions.harness||"
+    "!0===e.runOptions.excludeWorkspaceContext||"
+    "void 0!==e.runOptions.subagentTypeName||"
+    "void 0!==e.runOptions.parentAgentToolCallId||"
+    "!0===e.runOptions.directMetaParentChildSubagent"
+)
+SUBAGENT_TURN_N_NEW = (
+    SUBAGENT_TURN_N_OLD
+    + ",isSubagentTurn:void 0!==e.runOptions.subagentTypeName||"
+    "void 0!==e.runOptions.parentAgentToolCallId"
+)
+SUBAGENT_ROUTE_ORIGINAL = (
+    'return"userMessageAction"!==e.actionCase?"action-not-supported":'
+)
+SUBAGENT_ROUTE_PATCHED = (
+    'return"backgroundTaskCompletionAction"===e.actionCase?void 0:'
+    + SAND_SUBAGENT_FOLLOWUP_MARKER
+    + 'e.isSubagentTurn?void 0:'
+    + SAND_SUBAGENT_TURN_MARKER
+    + '"userMessageAction"!==e.actionCase?"action-not-supported":'
+)
 LEGACY_SAND_CLIENT_MARKER = "/*K" + "C_SAND_CLIENT_V1*/"
 LEGACY_SAND_ELIGIBILITY_MARKER = "/*K" + "C_SAND_ELIGIBILITY_V1*/"
 CLIENT_MARKER_PATTERN = re.escape(SAND_CLIENT_MARKER)
@@ -134,6 +187,9 @@ class PatchStats:
     agent_host_enablement: int = 0
     agent_host_identity: int = 0
     move_exec: int = 0
+    task_tool: int = 0
+    client_side_subagent: int = 0
+    subagent_turn: int = 0
 
     @property
     def total(self) -> int:
@@ -150,6 +206,9 @@ class PatchStats:
             + self.agent_host_enablement
             + self.agent_host_identity
             + self.move_exec
+            + self.task_tool
+            + self.client_side_subagent
+            + self.subagent_turn
         )
 
 
@@ -163,6 +222,9 @@ class RemoveStats:
     agent_host_enablement: int = 0
     agent_host_identity: int = 0
     move_exec: int = 0
+    task_tool: int = 0
+    client_side_subagent: int = 0
+    subagent_turn: int = 0
 
     @property
     def total(self) -> int:
@@ -175,6 +237,9 @@ class RemoveStats:
             + self.agent_host_enablement
             + self.agent_host_identity
             + self.move_exec
+            + self.task_tool
+            + self.client_side_subagent
+            + self.subagent_turn
         )
 
 
@@ -194,6 +259,9 @@ class PatchStatus:
     agent_host_enablement_markers: int
     agent_host_identity_markers: int
     move_exec_markers: int
+    task_tool_markers: int
+    client_side_subagent_markers: int
+    subagent_turn_markers: int
 
     @property
     def installed(self) -> bool:
@@ -1047,6 +1115,38 @@ def apply_patch_to_content(content: str) -> Tuple[str, PatchStats]:
                 MOVE_EXEC_ORIGINAL, MOVE_EXEC_PATCHED, 1
             )
             stats.move_exec += 1
+
+    # 子 agent Task 工具激活（675.js）
+    if SAND_TASK_TOOL_MARKER not in next_content:
+        if TASK_TOOL_ORIGINAL in next_content:
+            next_content = next_content.replace(
+                TASK_TOOL_ORIGINAL, TASK_TOOL_PATCHED, 1
+            )
+            stats.task_tool += 1
+
+    # 子 agent 走 client-side 本地路径（675.js）
+    if SAND_CLIENT_SIDE_SUBAGENT_MARKER not in next_content:
+        if CLIENT_SIDE_SUBAGENT_ORIGINAL in next_content:
+            next_content = next_content.replace(
+                CLIENT_SIDE_SUBAGENT_ORIGINAL, CLIENT_SIDE_SUBAGENT_PATCHED, 1
+            )
+            stats.client_side_subagent += 1
+
+    # 子 agent turn 放行（657.js）：isSubagentTurn 字段
+    if SUBAGENT_TURN_N_NEW not in next_content:
+        if SUBAGENT_TURN_N_OLD in next_content:
+            next_content = next_content.replace(
+                SUBAGENT_TURN_N_OLD, SUBAGENT_TURN_N_NEW, 1
+            )
+            stats.subagent_turn += 1
+
+    # 子 agent 路由短路（657.js）：followup + turn 走 managed-local
+    if SAND_SUBAGENT_TURN_MARKER not in next_content:
+        if SUBAGENT_ROUTE_ORIGINAL in next_content:
+            next_content = next_content.replace(
+                SUBAGENT_ROUTE_ORIGINAL, SUBAGENT_ROUTE_PATCHED, 1
+            )
+            stats.subagent_turn += 1
     return next_content, stats
 
 
@@ -1123,6 +1223,29 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
             MOVE_EXEC_PATCHED, MOVE_EXEC_ORIGINAL, 1
         )
         stats.move_exec += 1
+    if SAND_SUBAGENT_TURN_MARKER in next_content:
+        if SUBAGENT_ROUTE_PATCHED in next_content:
+            next_content = next_content.replace(
+                SUBAGENT_ROUTE_PATCHED, SUBAGENT_ROUTE_ORIGINAL, 1
+            )
+            stats.subagent_turn += 1
+    if SUBAGENT_TURN_N_NEW in next_content:
+        next_content = next_content.replace(
+            SUBAGENT_TURN_N_NEW, SUBAGENT_TURN_N_OLD, 1
+        )
+        stats.subagent_turn += 1
+    if SAND_CLIENT_SIDE_SUBAGENT_MARKER in next_content:
+        if CLIENT_SIDE_SUBAGENT_PATCHED in next_content:
+            next_content = next_content.replace(
+                CLIENT_SIDE_SUBAGENT_PATCHED, CLIENT_SIDE_SUBAGENT_ORIGINAL, 1
+            )
+            stats.client_side_subagent += 1
+    if SAND_TASK_TOOL_MARKER in next_content:
+        if TASK_TOOL_PATCHED in next_content:
+            next_content = next_content.replace(
+                TASK_TOOL_PATCHED, TASK_TOOL_ORIGINAL, 1
+            )
+            stats.task_tool += 1
     return next_content, stats
 
 
@@ -1314,6 +1437,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
     agent_host_enablement_markers = 0
     agent_host_identity_markers = 0
     move_exec_markers = 0
+    task_tool_markers = 0
+    client_side_subagent_markers = 0
+    subagent_turn_markers = 0
     legacy_client_markers = 0
     legacy_eligibility_markers = 0
     ide_matches = 0
@@ -1336,6 +1462,13 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
             SAND_AGENT_HOST_IDENTITY_MARKER
         )
         move_exec_count = content.count(SAND_MOVE_EXEC_MARKER)
+        task_tool_count = content.count(SAND_TASK_TOOL_MARKER)
+        client_side_subagent_count = content.count(
+            SAND_CLIENT_SIDE_SUBAGENT_MARKER
+        )
+        subagent_turn_count = content.count(
+            SAND_SUBAGENT_TURN_MARKER
+        ) + content.count(SAND_SUBAGENT_FOLLOWUP_MARKER)
         legacy_client_count = len(
             re.findall(
                 rf"([\"'])sand\1{LEGACY_CLIENT_MARKER_PATTERN}",
@@ -1368,6 +1501,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
             + agent_host_enablement_count
             + agent_host_identity_count
             + move_exec_count
+            + task_tool_count
+            + client_side_subagent_count
+            + subagent_turn_count
         ):
             patched_files.append(target)
         client_markers += client_count
@@ -1380,6 +1516,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         agent_host_enablement_markers += agent_host_enablement_count
         agent_host_identity_markers += agent_host_identity_count
         move_exec_markers += move_exec_count
+        task_tool_markers += task_tool_count
+        client_side_subagent_markers += client_side_subagent_count
+        subagent_turn_markers += subagent_turn_count
         for _key, rule in CLIENT_RULES:
             for match in rule.finditer(content):
                 if match.group(3) == "sand":
@@ -1401,6 +1540,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         agent_host_enablement_markers=agent_host_enablement_markers,
         agent_host_identity_markers=agent_host_identity_markers,
         move_exec_markers=move_exec_markers,
+        task_tool_markers=task_tool_markers,
+        client_side_subagent_markers=client_side_subagent_markers,
+        subagent_turn_markers=subagent_turn_markers,
     )
 
 
@@ -1784,6 +1926,9 @@ def _build_install_plan(
         total.agent_host_enablement += stats.agent_host_enablement
         total.agent_host_identity += stats.agent_host_identity
         total.move_exec += stats.move_exec
+        total.task_tool += stats.task_tool
+        total.client_side_subagent += stats.client_side_subagent
+        total.subagent_turn += stats.subagent_turn
     if plan:
         _update_extension_hashes(layout, plan)
         _sync_product_checksums(layout, plan)
@@ -1813,6 +1958,9 @@ def _build_uninstall_plan(
         total.agent_host_enablement += stats.agent_host_enablement
         total.agent_host_identity += stats.agent_host_identity
         total.move_exec += stats.move_exec
+        total.task_tool += stats.task_tool
+        total.client_side_subagent += stats.client_side_subagent
+        total.subagent_turn += stats.subagent_turn
     if plan:
         _update_extension_hashes(layout, plan)
         _sync_product_checksums(layout, plan)
@@ -1996,6 +2144,10 @@ def collect_status_lines() -> List[Tuple[str, str]]:
         lines.append(("[move-exec] 工具执行补丁已启用", ANSI_GREEN))
     elif status.installed:
         lines.append(("[move-exec] 工具执行补丁未启用", ANSI_YELLOW))
+    if status.task_tool_markers and status.client_side_subagent_markers and status.subagent_turn_markers:
+        lines.append(("[subagent] 子 agent（Task）已启用", ANSI_GREEN))
+    elif status.installed:
+        lines.append(("[subagent] 子 agent（Task）未启用", ANSI_YELLOW))
     if status.external_marker_count:
         lines.append(
             (f"[注意] 检测到其他工具标记：{status.external_marker_count} 处", ANSI_YELLOW)
