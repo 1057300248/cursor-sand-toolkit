@@ -100,6 +100,24 @@ SUBAGENT_ROUTE_PATCHED = (
     + SAND_SUBAGENT_TURN_MARKER
     + '"userMessageAction"!==e.actionCase?"action-not-supported":'
 )
+SAND_MAX_TOKENS_MARKER = "/*SAND_MAX_TOKENS_V1*/"
+MAX_TOKENS_ORIGINAL = (
+    "t.resolveExtendedUsage({inputTokens:n.inputTokens,"
+    "outputTokens:n.outputTokens,cacheReadTokens:n.cacheReadTokens,"
+    "cacheWriteTokens:n.cacheWriteTokens,maxTokens:n.maxTokens})"
+)
+MAX_TOKENS_PATCHED = (
+    "t.resolveExtendedUsage({inputTokens:n.inputTokens,"
+    "outputTokens:n.outputTokens,cacheReadTokens:n.cacheReadTokens,"
+    "cacheWriteTokens:n.cacheWriteTokens,maxTokens:(()=>{"
+    'const c=this.requestedModel?.parameters?.find(p=>p.id==="context")?.value;'
+    "if(void 0===c)return n.maxTokens;"
+    "const s=String(c).trim().toLowerCase();const num=parseFloat(s);"
+    "if(!Number.isFinite(num)||num<=0)return n.maxTokens;"
+    'const mult=s.endsWith("k")?1e3:s.endsWith("m")?1e6:s.endsWith("b")?1e9:1;'
+    "return num*mult})()})"
+    + SAND_MAX_TOKENS_MARKER
+)
 LEGACY_SAND_CLIENT_MARKER = "/*K" + "C_SAND_CLIENT_V1*/"
 LEGACY_SAND_ELIGIBILITY_MARKER = "/*K" + "C_SAND_ELIGIBILITY_V1*/"
 CLIENT_MARKER_PATTERN = re.escape(SAND_CLIENT_MARKER)
@@ -1148,6 +1166,14 @@ def apply_patch_to_content(content: str) -> Tuple[str, PatchStats]:
                 SUBAGENT_ROUTE_ORIGINAL, SUBAGENT_ROUTE_PATCHED, 1
             )
             stats.subagent_turn += 1
+
+    # 上下文窗口 maxTokens 覆盖（675.js）：后端按默认档返回，用 context 参数覆盖
+    if SAND_MAX_TOKENS_MARKER not in next_content:
+        if MAX_TOKENS_ORIGINAL in next_content:
+            next_content = next_content.replace(
+                MAX_TOKENS_ORIGINAL, MAX_TOKENS_PATCHED, 1
+            )
+            stats.task_tool += 1
     return next_content, stats
 
 
@@ -1245,6 +1271,12 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
         if TASK_TOOL_PATCHED in next_content:
             next_content = next_content.replace(
                 TASK_TOOL_PATCHED, TASK_TOOL_ORIGINAL, 1
+            )
+            stats.task_tool += 1
+    if SAND_MAX_TOKENS_MARKER in next_content:
+        if MAX_TOKENS_PATCHED in next_content:
+            next_content = next_content.replace(
+                MAX_TOKENS_PATCHED, MAX_TOKENS_ORIGINAL, 1
             )
             stats.task_tool += 1
     return next_content, stats
