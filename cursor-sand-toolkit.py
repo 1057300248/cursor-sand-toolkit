@@ -368,6 +368,7 @@ def _direct_stream_injection() -> str:
         'i.includes("claude")||i.includes("opus")||i.includes("sonnet")||i.includes("fable")?'
         '"anthropic":i.includes("gpt")||i.includes("codex")?"openai":"unknown",'
         'promptVersion:"latest",reasoningEffort:r.get("effort"),'
+        'agentTokenLimit:(function(){const v=r.get("context");if(void 0===v)return void 0;const s=String(v).trim().toLowerCase();const n=parseFloat(s);if(!Number.isFinite(n)||n<=0)return void 0;const m=s.endsWith("k")?1e3:s.endsWith("m")?1e6:s.endsWith("b")?1e9:1;return n*m})(),'
         'isGrok45ProductPrompt:i.includes("grok"),'
         'isClaude4x:i.includes("claude")||i.includes("opus")||i.includes("sonnet")||i.includes("fable"),'
         'isFable5:i.includes("fable-5"),'
