@@ -5,6 +5,7 @@
 
 命令行运行：
     python sand_stream_installer.py install
+    python sand_stream_installer.py install --transport direct
     python sand_stream_installer.py uninstall
     python sand_stream_installer.py set-path <Cursor路径|auto>
 """
@@ -32,20 +33,34 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 TOOL_NAME = "Sand Stream Toolkit"
-TOOL_VERSION = "1.4.0"
+TOOL_VERSION = "1.5.4"
 SUPPORTED_CURSOR_VERSION = "3.18.9"
 CONFIG_VERSION = 1
+STREAM_TRANSPORT_SESSION = "session"
+STREAM_TRANSPORT_DIRECT = "direct"
+STREAM_TRANSPORTS = (STREAM_TRANSPORT_SESSION, STREAM_TRANSPORT_DIRECT)
 
 SAND_CLIENT_MARKER = "/*SAND_CLIENT_MODE_V1*/"
 SAND_CLIENT_EXISTING_MARKER = "/*SAND_CLIENT_EXISTING_V1*/"
 SAND_ELIGIBILITY_MARKER = "/*SAND_ELIGIBILITY_MODE_V1*/"
 SAND_MANAGED_LOCAL_ROUTE_MARKER = "/*SAND_MANAGED_LOCAL_ROUTE_V1*/"
+SAND_SESSION_STREAM_MARKER = "/*SAND_SESSION_INFERENCE_STREAM_V1*/"
 SAND_DIRECT_STREAM_MARKER = "/*SAND_DIRECT_INFERENCE_STREAM_V1*/"
+# —— DSV3（Composer/Auto/grok-4.6）模型 ——
+# 3.18.9 的本地运行时没有 DSV3 harness 实现（dsv31018ToolsGenerator 只出现在报错串里）。
+# V1（fork 移植）只是屏蔽 useDsv3Harness 守卫，让请求继续往下走到 doe() 里抛
+# "Tools for dsv3-1018 are handled in dsv31018ToolsGenerator"，还要重试 3 次。
+# V2 改在元数据解析处降级：useDsv3Harness 时把 promptVersion 换成 "latest"（通用 harness，
+# 即旧版 direct 流下 grok 能跑的那条路），并把 useDsv3Harness 置 false，官方守卫原样保留。
+SAND_DSV3_LOCAL_LOOP_MARKER_V1 = "/*SAND_DSV3_LOCAL_LOOP_V1*/"
+SAND_DSV3_DEGRADE_MARKER = "/*SAND_DSV3_DEGRADE_V2*/"
 SAND_AGENT_HOST_ENABLEMENT_MARKER = "/*SAND_AGENT_HOST_ENABLEMENT_V1*/"
 SAND_LOCAL_RUNTIME_LOAD_MARKER = "/*SAND_LOCAL_RUNTIME_LOAD_V1*/"
 SAND_AGENT_HOST_IDENTITY_MARKER = "/*SAND_AGENT_HOST_IDENTITY_V1*/"
 SAND_MOVE_EXEC_MARKER = "/*SAND_MOVE_EXEC_V1*/"
-MOVE_EXEC_ORIGINAL = "p=await Promise.resolve(r.cursor.checkFeatureGate(Us)).catch(()=>!1)"
+MOVE_EXEC_ORIGINAL = (
+    "p=await Promise.resolve(r.cursor.checkFeatureGate(Us)).catch(()=>!1)"
+)
 MOVE_EXEC_PATCHED = "p=!0" + SAND_MOVE_EXEC_MARKER
 # —— 子 agent（Task 工具）激活 ——
 SAND_TASK_TOOL_MARKER = "/*SAND_TASK_TOOL_V1*/"
@@ -58,9 +73,7 @@ TASK_TOOL_PATCHED = (
     "subagentModels:{modelsBySlug:new Map},subagentModelOverrides:{},"
     "normalizeCustomSubagents:e=>e,enableGrindSwarmSubagent:!1,"
     "enableBrowserSubagent:!1,"
-    "getTaskToolConfig:()=>async()=>({})"
-    + SAND_TASK_TOOL_MARKER
-    + "}"
+    "getTaskToolConfig:()=>async()=>({})" + SAND_TASK_TOOL_MARKER + "}"
 )
 SAND_CLIENT_SIDE_SUBAGENT_MARKER = "/*SAND_CLIENT_SIDE_SUBAGENT_V1*/"
 CLIENT_SIDE_SUBAGENT_ORIGINAL = (
@@ -77,6 +90,7 @@ CLIENT_SIDE_SUBAGENT_PATCHED = (
 )
 SAND_SUBAGENT_TURN_MARKER = "/*SAND_SUBAGENT_TURN_V1*/"
 SAND_SUBAGENT_FOLLOWUP_MARKER = "/*SAND_SUBAGENT_FOLLOWUP_V1*/"
+SAND_PLAN_BUILD_MARKER = "/*SAND_PLAN_BUILD_V1*/"
 SUBAGENT_TURN_N_OLD = (
     "hasUnsupportedRunOptions:void 0!==e.runOptions.customSystemPrompt||"
     "void 0!==e.runOptions.harness||"
@@ -86,24 +100,51 @@ SUBAGENT_TURN_N_OLD = (
     "!0===e.runOptions.directMetaParentChildSubagent"
 )
 SUBAGENT_TURN_N_NEW = (
-    SUBAGENT_TURN_N_OLD
-    + ",isSubagentTurn:void 0!==e.runOptions.subagentTypeName||"
+    SUBAGENT_TURN_N_OLD + ",isSubagentTurn:void 0!==e.runOptions.subagentTypeName||"
     "void 0!==e.runOptions.parentAgentToolCallId"
 )
 SUBAGENT_ROUTE_ORIGINAL = (
     'return"userMessageAction"!==e.actionCase?"action-not-supported":'
 )
-SUBAGENT_ROUTE_PATCHED = (
+# V1：只放行 followup + 子 agent turn。Plan Build 走 executePlanAction，
+# 仍被判 action-not-supported → runtime connect → 后端拒 sand → Connection failed。
+SUBAGENT_ROUTE_PATCHED_V1 = (
     'return"backgroundTaskCompletionAction"===e.actionCase?void 0:'
     + SAND_SUBAGENT_FOLLOWUP_MARKER
-    + 'e.isSubagentTurn?void 0:'
+    + "e.isSubagentTurn?void 0:"
     + SAND_SUBAGENT_TURN_MARKER
     + '"userMessageAction"!==e.actionCase?"action-not-supported":'
+)
+SUBAGENT_ROUTE_PATCHED = (
+    'return"backgroundTaskCompletionAction"===e.actionCase||'
+    '"executePlanAction"===e.actionCase||'
+    '"resumeAction"===e.actionCase?void 0:'
+    + SAND_PLAN_BUILD_MARKER
+    + SAND_SUBAGENT_FOLLOWUP_MARKER
+    + "e.isSubagentTurn?void 0:"
+    + SAND_SUBAGENT_TURN_MARKER
+    + '"userMessageAction"!==e.actionCase?"action-not-supported":'
+)
+# —— MCP FileSystem 提示块恢复 ——
+# 675.js 的 O$() 只有在 mcpMetaToolOptions.enabled，或
+# featureFlags.enableMCPFileSystem 为真时才把 <mcp_file_system> 写进 system prompt。
+# 这个 flag 由服务端随会话下发，sand/managed-local 拿不到，于是 agent 不知道有哪些
+# MCP server（Context Usage 里 MCP 整类为 0），尽管 exec 已把描述写进 <projectDir>/mcps。
+SAND_MCP_FILESYSTEM_MARKER = "/*SAND_MCP_FILESYSTEM_V1*/"
+MCP_FILESYSTEM_ORIGINAL = (
+    "const t=e.requestContext?.mcpFileSystemOptions,"
+    "n=!0===e.featureFlags?.enableMCPFileSystem,"
+    'o=t?.workspaceProjectDir??""'
+)
+MCP_FILESYSTEM_PATCHED = (
+    "const t=e.requestContext?.mcpFileSystemOptions,"
+    "n=!0" + SAND_MCP_FILESYSTEM_MARKER + ","
+    'o=t?.workspaceProjectDir??""'
 )
 SAND_MAX_TOKENS_MARKER = "/*SAND_MAX_TOKENS_V1*/"
 SAND_MODE_RELAX_MARKER = "/*SAND_MODE_RELAX_V1*/"
 MODE_RELAX_ORIGINAL = 'e.requestedMode!==oe.xyI.AGENT?"mode-not-supported":'
-MODE_RELAX_PATCHED = '!1?' + SAND_MODE_RELAX_MARKER + '"mode-not-supported":'
+MODE_RELAX_PATCHED = "!1?" + SAND_MODE_RELAX_MARKER + '"mode-not-supported":'
 MAX_TOKENS_ORIGINAL = (
     "t.resolveExtendedUsage({inputTokens:n.inputTokens,"
     "outputTokens:n.outputTokens,cacheReadTokens:n.cacheReadTokens,"
@@ -118,9 +159,146 @@ MAX_TOKENS_PATCHED = (
     "const s=String(c).trim().toLowerCase();const num=parseFloat(s);"
     "if(!Number.isFinite(num)||num<=0)return n.maxTokens;"
     'const mult=s.endsWith("k")?1e3:s.endsWith("m")?1e6:s.endsWith("b")?1e9:1;'
-    "return num*mult})()})"
-    + SAND_MAX_TOKENS_MARKER
+    "return num*mult})()})" + SAND_MAX_TOKENS_MARKER
 )
+# —— 首字(TTFT)延迟优化：buildFromPushedData 等待 pushed rules 的内置超时 10s → 1s ——
+# 不同版本 minify 后的超时常量名不同：3.18.25 用 yCd，3.18.9 用 Ykd；值均为 1e4
+SAND_TTFT_MARKER = "/*SAND_TTFT_V1*/"
+TTFT_TIMEOUT_VARS = ("yCd", "Ykd")
+TTFT_ORIGINALS = tuple(f"{var}=1e4" for var in TTFT_TIMEOUT_VARS)
+TTFT_RESTORE_RE = re.compile(
+    rf"([A-Za-z_$][A-Za-z0-9_$]*)=1e3{re.escape(SAND_TTFT_MARKER)}"
+)
+# —— Rules/Skills 恢复 ——
+# cursor-agent-exec 的 aa() 在 cursorAgentHostEnabled 时只 registerAgentHostRuntime，
+# 不调用 na()（activateCursorAgentRuntime）。na() 才会 updateCursorRules/updateAgentSkills。
+# Sand 打开 agent-host 后这条链路被跳过，Context Usage 里 Rules/Skills 整类消失。
+# V4：直接改 aa()，host 启用时仍跑 na({registerAgentExecProvider:!1})，并置 ia=!0
+# 以便扩展停用走 ra()。不再从 host 侧 createLiveExecRuntime 抢跑（V1–V3）。
+SAND_RULES_SKILLS_MARKER = "/*SAND_RULES_SKILLS_V4*/"
+SAND_RULES_SKILLS_MARKER_V3 = "/*SAND_RULES_SKILLS_V3*/"
+SAND_RULES_SKILLS_MARKER_V2 = "/*SAND_RULES_SKILLS_V2*/"
+SAND_RULES_SKILLS_MARKER_V1 = "/*SAND_RULES_SKILLS_V1*/"
+RULES_SKILLS_EXEC_RUNTIME_MODULE = "71385"
+RULES_SKILLS_EXEC_ORIGINAL = (
+    "async function aa(e){if(j.cursor.cursorAgentHostEnabled){"
+    "const r=(t=oa,n=e.extensionPath,{...t,extensionPath:n});"
+    "return void e.subscriptions.push(j.cursor.registerAgentHostRuntime(r))}"
+    "var t,n;j.cursor.cursorAgentHostEnabled||(await na(e),ia=!0)}"
+)
+RULES_SKILLS_EXEC_PATCHED = (
+    "async function aa(e){if(j.cursor.cursorAgentHostEnabled){"
+    "const r=(t=oa,n=e.extensionPath,{...t,extensionPath:n});"
+    "e.subscriptions.push(j.cursor.registerAgentHostRuntime(r));"
+    + SAND_RULES_SKILLS_MARKER
+    + "await na(e,{registerAgentExecProvider:!1,"
+    "runtimeExtensionPath:e.extensionPath}),ia=!0;return}"
+    "var t,n;j.cursor.cursorAgentHostEnabled||(await na(e),ia=!0)}"
+)
+# 以下为 host 侧旧注入，仅用于剥离，不再新打。
+RULES_SKILLS_HOST_ORIGINAL = "i.subscriptions.push({dispose:()=>T.dispose()});"
+RULES_SKILLS_PATCHED_V3 = (
+    RULES_SKILLS_HOST_ORIGINAL
+    + SAND_RULES_SKILLS_MARKER_V3
+    + "try{const{createLiveExecRuntime:_sr}=await Promise.resolve().then("
+    + f"s.bind(s,{RULES_SKILLS_EXEC_RUNTIME_MODULE}));"
+    + "zs=await _sr({acquireTimeoutMs:2e3});"
+    + "await zs.activate(i,{registerAgentExecProvider:!1,"
+    + "runtimeExtensionPath:zs.extensionPath})"
+    + '}catch(_se){D.error("[SAND] rules/skills activation failed",_se)}'
+)
+RULES_SKILLS_PATCHED_V2 = (
+    RULES_SKILLS_HOST_ORIGINAL
+    + SAND_RULES_SKILLS_MARKER_V2
+    + "try{const{createLiveExecRuntime:_sr}=await Promise.resolve().then("
+    + f"s.bind(s,{RULES_SKILLS_EXEC_RUNTIME_MODULE}));"
+    + "const _sz=await _sr();"
+    + "await _sz.activate(i,{registerAgentExecProvider:!1,"
+    + "runtimeExtensionPath:_sz.extensionPath})"
+    + '}catch(_se){D.error("[SAND] rules/skills activation failed",_se)}'
+)
+RULES_SKILLS_PATCHED_V1 = (
+    RULES_SKILLS_HOST_ORIGINAL
+    + SAND_RULES_SKILLS_MARKER_V1
+    + "try{const{createLiveExecRuntime:_sr}=await Promise.resolve().then("
+    + f"s.bind(s,{RULES_SKILLS_EXEC_RUNTIME_MODULE}));"
+    + "const _sz=await _sr();"
+    + "await _sz.activate(i,{registerAgentExecProvider:!1,"
+    + "runtimeExtensionPath:_sz.extensionPath,gitExecutor:w,mcpProvider:T})"
+    + '}catch(_se){D.error("[SAND] rules/skills activation failed",_se)}'
+)
+_RULES_SKILLS_LEGACY_PAYLOADS: Tuple[Tuple[str, str], ...] = (
+    (SAND_RULES_SKILLS_MARKER_V3, RULES_SKILLS_PATCHED_V3),
+    (SAND_RULES_SKILLS_MARKER_V2, RULES_SKILLS_PATCHED_V2),
+    (SAND_RULES_SKILLS_MARKER_V1, RULES_SKILLS_PATCHED_V1),
+)
+JS_IDENTIFIER_PATTERN = r"[A-Za-z_$][A-Za-z0-9_$]*"
+# —— User Rules（Settings → Rules 里的非文件规则）注入 ——
+# 云端链路上 User/Team rules 由服务端拼进 prompt；managed-local 本地拼 prompt 时，
+# workbench 的 injectLocalModeNonFileRules 只在 localMode 才把 knowledgeBase 里的
+# User Rules 并进 requestContext.rules，于是 Context Usage 里 Rules 恒为 0。
+# 打掉这个守卫，让 buildFromPushedData 始终注入（sand 全走本地，不会与服务端重复）。
+SAND_USER_RULES_MARKER = "/*SAND_USER_RULES_V1*/"
+USER_RULES_ORIGINAL_RE = re.compile(
+    r"injectLocalModeNonFileRules\(e\)\{if\(!(?P<flags>"
+    + JS_IDENTIFIER_PATTERN
+    + r")\.localMode\)return;"
+)
+USER_RULES_PATCHED_RE = re.compile(
+    r"injectLocalModeNonFileRules\(e\)\{if\(!1&&!(?P<flags>"
+    + JS_IDENTIFIER_PATTERN
+    + r")\.localMode\)return;"
+    + re.escape(SAND_USER_RULES_MARKER)
+)
+# —— 同一 turn 多次交互（AskQuestion → CreatePlan）串号修复 ——
+# agent-host 的 interaction registry 用 `${turnId}:${query.id}` 做 key，而本地 loop
+# 构造 InteractionQuery 时从不填 id（uint32，恒为 0）。同一 turn 里第二个交互会直接
+# 命中第一个已缓存的应答：Plan 模式先问再建计划时 create_plan 拿到
+# askQuestionInteractionResponse，报 "Unexpected response for create plan query"。
+# 官方在 queryFromChild / querySurfacedForSubagent 里都带了 seq，唯独主会话 query 漏了。
+SAND_INTERACTION_SEQ_MARKER = "/*SAND_INTERACTION_SEQ_V1*/"
+INTERACTION_SEQ_ORIGINAL_RE = re.compile(
+    r"query\(e,t\)\{return (?P<awaiter>"
+    + JS_IDENTIFIER_PATTERN
+    + r")\(this,void 0,void 0,function\*\(\)\{const n=this\.activeTurnId;"
+    r"if\(void 0===n\)throw new Error\(`Agent host interaction query has no active turn: "
+    r"\$\{this\.sessionId\}`\);return this\.registry\.query\(e,n,t\)\}\)\}"
+)
+INTERACTION_SEQ_PATCHED_RE = re.compile(
+    r"query\(e,t\)\{return (?P<awaiter>"
+    + JS_IDENTIFIER_PATTERN
+    + r")\(this,void 0,void 0,function\*\(\)\{const n=this\.activeTurnId;"
+    r"if\(void 0===n\)throw new Error\(`Agent host interaction query has no active turn: "
+    r"\$\{this\.sessionId\}`\);"
+    + re.escape(SAND_INTERACTION_SEQ_MARKER)
+    + r"const s=this\.sandInteractionSeq=\(this\.sandInteractionSeq\?\?0\)\+1;"
+    r"return this\.registry\.query\(e,n,t,\{interactionId:`\$\{n\}:\$\{t\.id\}:\$\{s\}`\}\)\}\)\}"
+)
+
+
+def _interaction_seq_patched(awaiter: str) -> str:
+    return (
+        "query(e,t){return "
+        + awaiter
+        + "(this,void 0,void 0,function*(){const n=this.activeTurnId;"
+        "if(void 0===n)throw new Error(`Agent host interaction query has no active turn: "
+        "${this.sessionId}`);"
+        + SAND_INTERACTION_SEQ_MARKER
+        + "const s=this.sandInteractionSeq=(this.sandInteractionSeq??0)+1;"
+        "return this.registry.query(e,n,t,{interactionId:`${n}:${t.id}:${s}`})})}"
+    )
+
+
+def _interaction_seq_original(awaiter: str) -> str:
+    return (
+        "query(e,t){return "
+        + awaiter
+        + "(this,void 0,void 0,function*(){const n=this.activeTurnId;"
+        "if(void 0===n)throw new Error(`Agent host interaction query has no active turn: "
+        "${this.sessionId}`);return this.registry.query(e,n,t)})}"
+    )
+
+
 LEGACY_SAND_CLIENT_MARKER = "/*K" + "C_SAND_CLIENT_V1*/"
 LEGACY_SAND_ELIGIBILITY_MARKER = "/*K" + "C_SAND_ELIGIBILITY_V1*/"
 CLIENT_MARKER_PATTERN = re.escape(SAND_CLIENT_MARKER)
@@ -204,13 +382,20 @@ class PatchStats:
     migrated_eligibility: int = 0
     managed_local_route: int = 0
     local_runtime_load: int = 0
+    session_stream: int = 0
     direct_stream: int = 0
+    dsv3_local_loop: int = 0
     agent_host_enablement: int = 0
     agent_host_identity: int = 0
     move_exec: int = 0
     task_tool: int = 0
     client_side_subagent: int = 0
     subagent_turn: int = 0
+    ttft: int = 0
+    rules_skills: int = 0
+    user_rules: int = 0
+    mcp_filesystem: int = 0
+    interaction_seq: int = 0
 
     @property
     def total(self) -> int:
@@ -223,13 +408,20 @@ class PatchStats:
             + self.migrated_eligibility
             + self.managed_local_route
             + self.local_runtime_load
+            + self.session_stream
             + self.direct_stream
+            + self.dsv3_local_loop
             + self.agent_host_enablement
             + self.agent_host_identity
             + self.move_exec
             + self.task_tool
             + self.client_side_subagent
             + self.subagent_turn
+            + self.ttft
+            + self.rules_skills
+            + self.user_rules
+            + self.mcp_filesystem
+            + self.interaction_seq
         )
 
 
@@ -239,13 +431,20 @@ class RemoveStats:
     eligibility: int = 0
     managed_local_route: int = 0
     local_runtime_load: int = 0
+    session_stream: int = 0
     direct_stream: int = 0
+    dsv3_local_loop: int = 0
     agent_host_enablement: int = 0
     agent_host_identity: int = 0
     move_exec: int = 0
     task_tool: int = 0
     client_side_subagent: int = 0
     subagent_turn: int = 0
+    ttft: int = 0
+    rules_skills: int = 0
+    user_rules: int = 0
+    mcp_filesystem: int = 0
+    interaction_seq: int = 0
 
     @property
     def total(self) -> int:
@@ -254,13 +453,20 @@ class RemoveStats:
             + self.eligibility
             + self.managed_local_route
             + self.local_runtime_load
+            + self.session_stream
             + self.direct_stream
+            + self.dsv3_local_loop
             + self.agent_host_enablement
             + self.agent_host_identity
             + self.move_exec
             + self.task_tool
             + self.client_side_subagent
             + self.subagent_turn
+            + self.ttft
+            + self.rules_skills
+            + self.user_rules
+            + self.mcp_filesystem
+            + self.interaction_seq
         )
 
 
@@ -276,13 +482,22 @@ class PatchStatus:
     patched_files: Tuple[Path, ...]
     managed_local_route_markers: int
     local_runtime_load_markers: int
+    session_stream_markers: int
     direct_stream_markers: int
+    dsv3_local_loop_markers: int
     agent_host_enablement_markers: int
     agent_host_identity_markers: int
     move_exec_markers: int
     task_tool_markers: int
     client_side_subagent_markers: int
     subagent_turn_markers: int
+    ttft_markers: int
+    rules_skills_markers: int
+    rules_skills_legacy_markers: int
+    dsv3_legacy_markers: int
+    user_rules_markers: int
+    mcp_filesystem_markers: int
+    interaction_seq_markers: int
 
     @property
     def installed(self) -> bool:
@@ -293,18 +508,30 @@ class PatchStatus:
             + self.legacy_eligibility_markers
             + self.managed_local_route_markers
             + self.local_runtime_load_markers
+            + self.session_stream_markers
             + self.direct_stream_markers
+            + self.dsv3_local_loop_markers
+            + self.dsv3_legacy_markers
             + self.agent_host_enablement_markers
             + self.agent_host_identity_markers
             > 0
         )
 
     @property
+    def stream_transport(self) -> Optional[str]:
+        if self.session_stream_markers == 1 and self.direct_stream_markers == 0:
+            return STREAM_TRANSPORT_SESSION
+        if self.direct_stream_markers == 1 and self.session_stream_markers == 0:
+            return STREAM_TRANSPORT_DIRECT
+        return None
+
+    @property
     def stream_mode_installed(self) -> bool:
         return (
             self.managed_local_route_markers > 0
             and self.local_runtime_load_markers > 0
-            and self.direct_stream_markers > 0
+            and self.dsv3_local_loop_markers > 0
+            and self.stream_transport is not None
             and self.agent_host_enablement_markers > 0
             and self.agent_host_identity_markers > 0
         )
@@ -339,7 +566,7 @@ def _compile_client_rules() -> Tuple[Tuple[str, re.Pattern[str]], ...]:
 CLIENT_RULES = _compile_client_rules()
 
 MANAGED_LOCAL_ROUTE_ORIGINAL = (
-    'try{return(yield o.checkFeatureGate(ae))?'
+    "try{return(yield o.checkFeatureGate(ae))?"
     '{runtime:"managed-local",reason:"eligible"}:'
     '{runtime:"connect",reason:"gate-off"}}catch(e)'
 )
@@ -348,20 +575,73 @@ MANAGED_LOCAL_ROUTE_PATCHED = (
     + SAND_MANAGED_LOCAL_ROUTE_MARKER
     + '{runtime:"managed-local",reason:"sand-client"}}catch(e)'
 )
-LOCAL_RUNTIME_LOAD_ORIGINAL = (
-    "let t=!1;try{t=await r.cursor.checkFeatureGate(Ds)}"
-)
-LOCAL_RUNTIME_LOAD_PATCHED = (
-    "let t=!0;"
-    + SAND_LOCAL_RUNTIME_LOAD_MARKER
-    + "try{t=!0}"
-)
+LOCAL_RUNTIME_LOAD_ORIGINAL = "let t=!1;try{t=await r.cursor.checkFeatureGate(Ds)}"
+LOCAL_RUNTIME_LOAD_PATCHED = "let t=!0;" + SAND_LOCAL_RUNTIME_LOAD_MARKER + "try{t=!0}"
 AGENT_HOST_IDENTITY_ORIGINAL = 'clientIdentity:{clientType:"ide"}'
 AGENT_HOST_IDENTITY_PATCHED = (
-    'clientIdentity:{clientType:"sand"'
-    + SAND_AGENT_HOST_IDENTITY_MARKER
-    + "}"
+    'clientIdentity:{clientType:"sand"' + SAND_AGENT_HOST_IDENTITY_MARKER + "}"
 )
+# V1 守卫补丁（仅用于剥离还原，不再新打）
+DSV3_LOCAL_LOOP_GUARD_RE = re.compile(
+    r"if\((?P<metadata>"
+    + JS_IDENTIFIER_PATTERN
+    + r")\.useDsv3Harness\)throw new (?P<error>"
+    + JS_IDENTIFIER_PATTERN
+    + r')\("dsv3-harness-not-supported",(?P<model>'
+    + JS_IDENTIFIER_PATTERN
+    + r")\);"
+)
+DSV3_LOCAL_LOOP_PATCHED_V1_RE = re.compile(
+    r"if\(!1&&(?P<metadata>"
+    + JS_IDENTIFIER_PATTERN
+    + r")\.useDsv3Harness\)"
+    + re.escape(SAND_DSV3_LOCAL_LOOP_MARKER_V1)
+    + r"throw new (?P<error>"
+    + JS_IDENTIFIER_PATTERN
+    + r')\("dsv3-harness-not-supported",(?P<model>'
+    + JS_IDENTIFIER_PATTERN
+    + r")\);"
+)
+# V2 元数据降级：function nre(e,t){if(void 0!==e)return{promptModelInfo:ore(e,t),
+#   useDsv3Harness:e.useDsv3Harness,agentTokenLimit:...,estimatedCacheTtlMs:...}}
+DSV3_METADATA_RESOLVER_RE = re.compile(
+    r"function (?P<resolver>"
+    + JS_IDENTIFIER_PATTERN
+    + r")\(e,t\)\{if\(void 0!==e\)return\{promptModelInfo:(?P<info>"
+    + JS_IDENTIFIER_PATTERN
+    + r")\(e,t\),useDsv3Harness:e\.useDsv3Harness,agentTokenLimit:e\.agentTokenLimit,"
+    r"estimatedCacheTtlMs:e\.estimatedCacheTtlMs\}\}"
+)
+DSV3_METADATA_DEGRADED_RE = re.compile(
+    r"function (?P<resolver>"
+    + JS_IDENTIFIER_PATTERN
+    + r")\(e,t\)\{if\(void 0!==e\)return\{promptModelInfo:(?P<info>"
+    + JS_IDENTIFIER_PATTERN
+    + r")\(e\.useDsv3Harness\?"
+    + re.escape(SAND_DSV3_DEGRADE_MARKER)
+    + r'Object\.assign\(\{\},e,\{promptVersion:"latest"\}\):e,t\),useDsv3Harness:!1,'
+    r"agentTokenLimit:e\.agentTokenLimit,estimatedCacheTtlMs:e\.estimatedCacheTtlMs\}\}"
+)
+
+
+def _dsv3_metadata_original(resolver: str, info: str) -> str:
+    return (
+        f"function {resolver}(e,t){{if(void 0!==e)return{{promptModelInfo:{info}(e,t),"
+        "useDsv3Harness:e.useDsv3Harness,agentTokenLimit:e.agentTokenLimit,"
+        "estimatedCacheTtlMs:e.estimatedCacheTtlMs}}"
+    )
+
+
+def _dsv3_metadata_degraded(resolver: str, info: str) -> str:
+    return (
+        f"function {resolver}(e,t){{if(void 0!==e)return{{promptModelInfo:{info}("
+        "e.useDsv3Harness?"
+        + SAND_DSV3_DEGRADE_MARKER
+        + 'Object.assign({},e,{promptVersion:"latest"}):e,t),useDsv3Harness:!1,'
+        "agentTokenLimit:e.agentTokenLimit,estimatedCacheTtlMs:e.estimatedCacheTtlMs}}"
+    )
+
+
 DIRECT_STREAM_ANCHOR = (
     "function hre(e){return t=>{return n=this,o=void 0,s=function*(){"
 )
@@ -375,16 +655,105 @@ AGENT_HOST_ENABLEMENT_PATCH_RE = re.compile(
 )
 
 
+def _validate_stream_transport(transport: str) -> str:
+    if transport not in STREAM_TRANSPORTS:
+        choices = ", ".join(STREAM_TRANSPORTS)
+        raise SandToolError(f"不支持的推理传输模式：{transport}（可选：{choices}）")
+    return transport
+
+
+def _stream_transport_label(transport: Optional[str]) -> str:
+    if transport == STREAM_TRANSPORT_SESSION:
+        return "会话流"
+    if transport == STREAM_TRANSPORT_DIRECT:
+        return "直连流"
+    return "未选择"
+
+
+def _strip_dsv3_guard_patch_v1(content: str) -> Tuple[str, int]:
+    """还原 V1 屏蔽掉的官方 useDsv3Harness 守卫。"""
+    original_count = len(DSV3_LOCAL_LOOP_GUARD_RE.findall(content))
+    patched_count = len(DSV3_LOCAL_LOOP_PATCHED_V1_RE.findall(content))
+    marker_count = content.count(SAND_DSV3_LOCAL_LOOP_MARKER_V1)
+    if marker_count == 0 and patched_count == 0:
+        return content, 0
+    if marker_count != 1 or patched_count != 1 or original_count != 0:
+        raise SandToolError(
+            "DSV3 旧版（V1）守卫补丁无法安全还原："
+            f"original={original_count}, patched={patched_count}, marker={marker_count}"
+        )
+
+    def restore_guard(match: re.Match[str]) -> str:
+        return (
+            "if("
+            + match.group("metadata")
+            + ".useDsv3Harness)throw new "
+            + match.group("error")
+            + '("dsv3-harness-not-supported",'
+            + match.group("model")
+            + ");"
+        )
+
+    return DSV3_LOCAL_LOOP_PATCHED_V1_RE.subn(restore_guard, content, count=1)
+
+
+def apply_dsv3_degrade_patch(content: str) -> Tuple[str, int]:
+    """先剥掉 V1 守卫补丁，再在元数据解析处把 DSV3 模型降级到通用 harness（V2）。"""
+    content, _stripped = _strip_dsv3_guard_patch_v1(content)
+    original_count = len(DSV3_METADATA_RESOLVER_RE.findall(content))
+    patched_count = len(DSV3_METADATA_DEGRADED_RE.findall(content))
+    marker_count = content.count(SAND_DSV3_DEGRADE_MARKER)
+    if marker_count == 1 and original_count == 0 and patched_count == 1:
+        return content, 0
+    if marker_count != 0 or patched_count != 0:
+        raise SandToolError(
+            "DSV3 降级补丁状态异常："
+            f"original={original_count}, patched={patched_count}, marker={marker_count}"
+        )
+    if original_count == 0:
+        return content, 0
+    if original_count != 1:
+        raise SandToolError(f"DSV3 元数据解析函数匹配异常：original={original_count}")
+    return DSV3_METADATA_RESOLVER_RE.subn(
+        lambda match: _dsv3_metadata_degraded(
+            match.group("resolver"), match.group("info")
+        ),
+        content,
+        count=1,
+    )
+
+
+def remove_dsv3_degrade_patch(content: str) -> Tuple[str, int]:
+    """还原 V2 降级补丁；顺带清掉 V1 残留。"""
+    content, stripped = _strip_dsv3_guard_patch_v1(content)
+    original_count = len(DSV3_METADATA_RESOLVER_RE.findall(content))
+    patched_count = len(DSV3_METADATA_DEGRADED_RE.findall(content))
+    marker_count = content.count(SAND_DSV3_DEGRADE_MARKER)
+    if marker_count == 0 and patched_count == 0:
+        return content, stripped
+    if marker_count != 1 or patched_count != 1 or original_count != 0:
+        raise SandToolError(
+            "DSV3 降级补丁无法安全还原："
+            f"original={original_count}, patched={patched_count}, marker={marker_count}"
+        )
+    content, restored = DSV3_METADATA_DEGRADED_RE.subn(
+        lambda match: _dsv3_metadata_original(
+            match.group("resolver"), match.group("info")
+        ),
+        content,
+        count=1,
+    )
+    return content, stripped + restored
+
+
 def _direct_stream_injection() -> str:
     return (
-        "{"
-        + SAND_DIRECT_STREAM_MARKER
-        + 'const n=t.requestedModel;'
+        "{" + SAND_DIRECT_STREAM_MARKER + "const n=t.requestedModel;"
         'if(void 0===n)throw new Error("Sand direct Stream requires requestedModel");'
         'const o=String(n.modelId||""),i=o.toLowerCase(),'
-        'r=new Map(n.parameters.map(e=>[e.id,e.value])),'
-        's=new Joe(e,n,void 0,void 0).getSession(),'
-        'p={getExecutor:e=>new RK(s.getExecutor(e))},'
+        "r=new Map(n.parameters.map(e=>[e.id,e.value])),"
+        "s=new Joe(e,n,void 0,void 0).getSession(),"
+        "p={getExecutor:e=>new RK(s.getExecutor(e))},"
         'a={vendor:i.includes("grok")?"xai":i.includes("gemini")?"gemini":'
         'i.includes("claude")||i.includes("opus")||i.includes("sonnet")||i.includes("fable")?'
         '"anthropic":i.includes("gpt")||i.includes("codex")?"openai":"unknown",'
@@ -406,10 +775,11 @@ def _direct_stream_injection() -> str:
         'isGpt53Codex:i.includes("gpt-5.3-codex"),'
         'isGpt52Codex:i.includes("gpt-5.2-codex"),'
         'isCodexFamily:i.includes("codex"),isGpt5Family:i.includes("gpt-5")};'
-        'return{promptSession:s,promptToolSession:p,attempt:{resolvedModel:cre(n),'
-        'supportsSelfSummary:!1,routedModelDisplayName:o,'
-        'resolvedModelMetadata:nre(a,o),finish:()=>Promise.resolve()}}}'
+        "return{promptSession:s,promptToolSession:p,attempt:{resolvedModel:cre(n),"
+        "supportsSelfSummary:!1,routedModelDisplayName:o,"
+        "resolvedModelMetadata:nre(a,o),finish:()=>Promise.resolve()}}}"
     )
+
 
 def _platform_name() -> str:
     if sys.platform == "win32":
@@ -519,12 +889,7 @@ def _config_dir() -> Path:
             / "SandClientModeStream"
             / "sand-client-cli"
         )
-    return (
-        Path.home()
-        / ".config"
-        / "SandClientModeStream"
-        / "sand-client-cli"
-    )
+    return Path.home() / ".config" / "SandClientModeStream" / "sand-client-cli"
 
 
 def _config_path() -> Path:
@@ -746,7 +1111,9 @@ def layout_from_path(value: Union[str, Path]) -> CursorLayout:
                 )
 
             ext_host = app_root.joinpath(*EXT_HOST_REL.split("/"))
-            ext_host_real = ext_host.resolve(strict=True) if ext_host.is_file() else None
+            ext_host_real = (
+                ext_host.resolve(strict=True) if ext_host.is_file() else None
+            )
             version = str(product.get("version") or product.get("commit") or "未知")
             return CursorLayout(
                 install_root=install_root,
@@ -767,7 +1134,11 @@ def layout_from_path(value: Union[str, Path]) -> CursorLayout:
 
 
 def _powershell_executable() -> Optional[str]:
-    return shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
+    return (
+        shutil.which("powershell.exe")
+        or shutil.which("powershell")
+        or shutil.which("pwsh")
+    )
 
 
 def _windows_running_candidates() -> List[str]:
@@ -782,7 +1153,14 @@ def _windows_running_candidates() -> List[str]:
     )
     try:
         result = subprocess.run(
-            [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+            [
+                powershell,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -828,6 +1206,7 @@ def _windows_registry_candidates() -> List[str]:
                     except OSError:
                         continue
                     with child:
+
                         def read(name_: str) -> str:
                             try:
                                 return str(winreg.QueryValueEx(child, name_)[0] or "")
@@ -836,14 +1215,19 @@ def _windows_registry_candidates() -> List[str]:
 
                         display_name = read("DisplayName").strip()
                         publisher = read("Publisher").strip()
-                        if display_name.casefold() != "cursor" and "anysphere" not in publisher.casefold():
+                        if (
+                            display_name.casefold() != "cursor"
+                            and "anysphere" not in publisher.casefold()
+                        ):
                             continue
                         install_location = read("InstallLocation").strip().strip('"')
                         display_icon = read("DisplayIcon").strip().strip('"')
                         if install_location:
                             candidates.append(install_location)
                         if display_icon:
-                            icon_path = re.sub(r",\s*-?\d+$", "", display_icon).strip('"')
+                            icon_path = re.sub(r",\s*-?\d+$", "", display_icon).strip(
+                                '"'
+                            )
                             candidates.append(icon_path)
     return candidates
 
@@ -951,9 +1335,12 @@ def _default_candidate_groups() -> Iterable[Tuple[str, Sequence[str]]]:
     elif sys.platform == "darwin":
         yield "运行中的 Cursor", _mac_running_candidates()
         yield "macOS Spotlight", _mac_spotlight_candidates()
-        yield "macOS 默认目录", (
-            "/Applications/Cursor.app",
-            str(Path.home() / "Applications" / "Cursor.app"),
+        yield (
+            "macOS 默认目录",
+            (
+                "/Applications/Cursor.app",
+                str(Path.home() / "Applications" / "Cursor.app"),
+            ),
         )
 
     path_cursor = shutil.which("cursor")
@@ -1026,17 +1413,30 @@ def save_cursor_path(value: str) -> Optional[CursorLayout]:
     return layout
 
 
-def apply_patch_to_content(content: str) -> Tuple[str, PatchStats]:
+def _strip_legacy_rules_skills(content: str) -> Tuple[str, bool, int]:
+    """剥掉 host 侧 V1–V3。标记还在但整串对不上时原样返回并 ok=False。"""
+    next_content = content
+    removed = 0
+    for marker, payload in _RULES_SKILLS_LEGACY_PAYLOADS:
+        if marker not in next_content:
+            continue
+        if payload not in next_content:
+            return content, False, 0
+        next_content = next_content.replace(payload, RULES_SKILLS_HOST_ORIGINAL, 1)
+        removed += 1
+    return next_content, True, removed
+
+
+def apply_patch_to_content(
+    content: str,
+    transport: str = STREAM_TRANSPORT_SESSION,
+) -> Tuple[str, PatchStats]:
+    transport = _validate_stream_transport(transport)
     stats = PatchStats()
     next_content = content
-    legacy_client_re = re.compile(
-        rf"([\"'])sand\1{LEGACY_CLIENT_MARKER_PATTERN}"
-    )
+    legacy_client_re = re.compile(rf"([\"'])sand\1{LEGACY_CLIENT_MARKER_PATTERN}")
     next_content, stats.migrated_client = legacy_client_re.subn(
-        lambda match: match.group(1)
-        + "sand"
-        + match.group(1)
-        + SAND_CLIENT_MARKER,
+        lambda match: match.group(1) + "sand" + match.group(1) + SAND_CLIENT_MARKER,
         next_content,
     )
     legacy_eligibility = "return!1;" + LEGACY_SAND_ELIGIBILITY_MARKER
@@ -1046,6 +1446,7 @@ def apply_patch_to_content(content: str) -> Tuple[str, PatchStats]:
         "return!1;" + SAND_ELIGIBILITY_MARKER,
     )
     for key, rule in CLIENT_RULES:
+
         def replace_client(match: re.Match[str], stat_key: str = key) -> str:
             current = match.group(3)
             setattr(stats, stat_key, getattr(stats, stat_key) + 1)
@@ -1054,13 +1455,7 @@ def apply_patch_to_content(content: str) -> Tuple[str, PatchStats]:
                 marker = SAND_CLIENT_EXISTING_MARKER
             else:
                 marker = SAND_CLIENT_MARKER
-            return (
-                match.group(1)
-                + match.group(2)
-                + "sand"
-                + match.group(2)
-                + marker
-            )
+            return match.group(1) + match.group(2) + "sand" + match.group(2) + marker
 
         next_content = rule.sub(replace_client, next_content)
 
@@ -1099,19 +1494,48 @@ def apply_patch_to_content(content: str) -> Tuple[str, PatchStats]:
         )
         stats.agent_host_identity += identity_count
 
+    next_content, dsv3_count = apply_dsv3_degrade_patch(next_content)
+    stats.dsv3_local_loop += dsv3_count
+
+    # 会话流只打标记，保留原生 runInference，网页 Usage 才会记到 bot/free。
+    # 直连流自建 Joe session，会绕开这条计费链，只作兼容回退。
     direct_injection = _direct_stream_injection()
-    if (
-        SAND_DIRECT_STREAM_MARKER not in next_content
-        and DIRECT_STREAM_ANCHOR in next_content
-    ):
-        next_content = next_content.replace(
-            DIRECT_STREAM_ANCHOR,
-            DIRECT_STREAM_ANCHOR + direct_injection,
-            1,
-        )
-        stats.direct_stream += 1
+    if transport == STREAM_TRANSPORT_SESSION:
+        if direct_injection in next_content:
+            next_content = next_content.replace(direct_injection, "", 1)
+        session_marker_count = next_content.count(SAND_SESSION_STREAM_MARKER)
+        if session_marker_count > 1:
+            raise SandToolError(
+                f"原生会话 Stream marker 数量异常：{session_marker_count}"
+            )
+        if session_marker_count == 0 and DIRECT_STREAM_ANCHOR in next_content:
+            next_content = next_content.replace(
+                DIRECT_STREAM_ANCHOR,
+                DIRECT_STREAM_ANCHOR + SAND_SESSION_STREAM_MARKER,
+                1,
+            )
+            stats.session_stream += 1
+    else:
+        session_marker_count = next_content.count(SAND_SESSION_STREAM_MARKER)
+        if session_marker_count > 1:
+            raise SandToolError(
+                f"原生会话 Stream marker 数量异常：{session_marker_count}"
+            )
+        if session_marker_count == 1:
+            next_content = next_content.replace(SAND_SESSION_STREAM_MARKER, "", 1)
+        if (
+            SAND_DIRECT_STREAM_MARKER not in next_content
+            and DIRECT_STREAM_ANCHOR in next_content
+        ):
+            next_content = next_content.replace(
+                DIRECT_STREAM_ANCHOR,
+                DIRECT_STREAM_ANCHOR + direct_injection,
+                1,
+            )
+            stats.direct_stream += 1
 
     if SAND_AGENT_HOST_ENABLEMENT_MARKER not in next_content:
+
         def enable_agent_host(match: re.Match[str]) -> str:
             variable = match.group(2)
             return (
@@ -1162,9 +1586,15 @@ def apply_patch_to_content(content: str) -> Tuple[str, PatchStats]:
             )
             stats.subagent_turn += 1
 
-    # 子 agent 路由短路（657.js）：followup + turn 走 managed-local
-    if SAND_SUBAGENT_TURN_MARKER not in next_content:
-        if SUBAGENT_ROUTE_ORIGINAL in next_content:
+    # 子 agent / Plan Build 路由短路（657.js）：followup、turn、
+    # executePlanAction、resumeAction 走 managed-local。
+    if SAND_PLAN_BUILD_MARKER not in next_content:
+        if SUBAGENT_ROUTE_PATCHED_V1 in next_content:
+            next_content = next_content.replace(
+                SUBAGENT_ROUTE_PATCHED_V1, SUBAGENT_ROUTE_PATCHED, 1
+            )
+            stats.subagent_turn += 1
+        elif SUBAGENT_ROUTE_ORIGINAL in next_content:
             next_content = next_content.replace(
                 SUBAGENT_ROUTE_ORIGINAL, SUBAGENT_ROUTE_PATCHED, 1
             )
@@ -1185,14 +1615,67 @@ def apply_patch_to_content(content: str) -> Tuple[str, PatchStats]:
                 MAX_TOKENS_ORIGINAL, MAX_TOKENS_PATCHED, 1
             )
             stats.task_tool += 1
+
+    # 首字(TTFT)延迟优化（workbench.desktop.main.js）：buildFromPushedData
+    # 等待 pushed rules 的超时 10s → 1s。多版本锚点 yCd(3.18.25)/Ykd(3.18.9)。
+    if SAND_TTFT_MARKER not in next_content:
+        for original in TTFT_ORIGINALS:
+            if next_content.count(original) == 1:
+                patched_text = original.replace("=1e4", "=1e3") + SAND_TTFT_MARKER
+                next_content = next_content.replace(original, patched_text, 1)
+                stats.ttft += 1
+                break
+
+    # Rules/Skills 恢复（cursor-agent-exec/dist/main.js）：host 启用时 aa() 跳过 na()。
+    # 先剥掉 host 侧 V1–V3 旧注入，再改 aa() 补调 na()。
+    next_content, legacy_ok, _removed = _strip_legacy_rules_skills(next_content)
+    if SAND_RULES_SKILLS_MARKER not in next_content:
+        if legacy_ok and next_content.count(RULES_SKILLS_EXEC_ORIGINAL) == 1:
+            next_content = next_content.replace(
+                RULES_SKILLS_EXEC_ORIGINAL, RULES_SKILLS_EXEC_PATCHED, 1
+            )
+            stats.rules_skills += 1
+
+    # User Rules 注入（workbench.desktop.main.js）：injectLocalModeNonFileRules 去掉
+    # localMode 守卫，managed-local 也把 Settings 里的 User/Team rules 并进 requestContext。
+    if SAND_USER_RULES_MARKER not in next_content:
+        if len(USER_RULES_ORIGINAL_RE.findall(next_content)) == 1:
+            next_content, user_rules_count = USER_RULES_ORIGINAL_RE.subn(
+                lambda match: (
+                    "injectLocalModeNonFileRules(e){if(!1&&!"
+                    + match.group("flags")
+                    + ".localMode)return;"
+                    + SAND_USER_RULES_MARKER
+                ),
+                next_content,
+                count=1,
+            )
+            stats.user_rules += user_rules_count
+
+    # MCP FileSystem 提示块（675.js）：不再依赖服务端下发的 enableMCPFileSystem，
+    # 让 <mcp_file_system> 始终进 system prompt，agent 才知道去 <projectDir>/mcps 找 server。
+    if SAND_MCP_FILESYSTEM_MARKER not in next_content:
+        if next_content.count(MCP_FILESYSTEM_ORIGINAL) == 1:
+            next_content = next_content.replace(
+                MCP_FILESYSTEM_ORIGINAL, MCP_FILESYSTEM_PATCHED, 1
+            )
+            stats.mcp_filesystem += 1
+
+    # 同一 turn 多次交互串号修复（657.js）：主会话 query 也带 seq。
+    if SAND_INTERACTION_SEQ_MARKER not in next_content:
+        if len(INTERACTION_SEQ_ORIGINAL_RE.findall(next_content)) == 1:
+            next_content, seq_count = INTERACTION_SEQ_ORIGINAL_RE.subn(
+                lambda match: _interaction_seq_patched(match.group("awaiter")),
+                next_content,
+                count=1,
+            )
+            stats.interaction_seq += seq_count
     return next_content, stats
 
 
 def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
     stats = RemoveStats()
-    legacy_client_re = re.compile(
-        rf"([\"'])sand\1{LEGACY_CLIENT_MARKER_PATTERN}"
-    )
+    legacy_client_re = re.compile(rf"([\"'])sand\1{LEGACY_CLIENT_MARKER_PATTERN}")
     next_content, legacy_client_count = legacy_client_re.subn(
         lambda match: match.group(1) + "ide" + match.group(1),
         content,
@@ -1203,9 +1686,7 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
     next_content = next_content.replace(legacy_eligibility, "")
     stats.eligibility += legacy_eligibility_count
     client_re = re.compile(rf"([\"'])sand\1{CLIENT_MARKER_PATTERN}")
-    existing_re = re.compile(
-        rf"([\"'])sand\1{CLIENT_EXISTING_MARKER_PATTERN}"
-    )
+    existing_re = re.compile(rf"([\"'])sand\1{CLIENT_EXISTING_MARKER_PATTERN}")
 
     def remove_client(match: re.Match[str]) -> str:
         stats.client_type += 1
@@ -1245,11 +1726,19 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
         )
         stats.agent_host_identity += identity_count
 
+    session_count = next_content.count(SAND_SESSION_STREAM_MARKER)
+    if session_count:
+        next_content = next_content.replace(SAND_SESSION_STREAM_MARKER, "")
+        stats.session_stream += session_count
+
     direct_injection = _direct_stream_injection()
     direct_count = next_content.count(direct_injection)
     if direct_count:
         next_content = next_content.replace(direct_injection, "")
         stats.direct_stream += direct_count
+
+    next_content, dsv3_count = remove_dsv3_degrade_patch(next_content)
+    stats.dsv3_local_loop += dsv3_count
 
     next_content, agent_host_count = AGENT_HOST_ENABLEMENT_PATCH_RE.subn(
         lambda match: match.group(2) + match.group(1) + match.group(3),
@@ -1257,14 +1746,17 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
     )
     stats.agent_host_enablement += agent_host_count
     if MOVE_EXEC_PATCHED in next_content:
-        next_content = next_content.replace(
-            MOVE_EXEC_PATCHED, MOVE_EXEC_ORIGINAL, 1
-        )
+        next_content = next_content.replace(MOVE_EXEC_PATCHED, MOVE_EXEC_ORIGINAL, 1)
         stats.move_exec += 1
     if SAND_SUBAGENT_TURN_MARKER in next_content:
         if SUBAGENT_ROUTE_PATCHED in next_content:
             next_content = next_content.replace(
                 SUBAGENT_ROUTE_PATCHED, SUBAGENT_ROUTE_ORIGINAL, 1
+            )
+            stats.subagent_turn += 1
+        elif SUBAGENT_ROUTE_PATCHED_V1 in next_content:
+            next_content = next_content.replace(
+                SUBAGENT_ROUTE_PATCHED_V1, SUBAGENT_ROUTE_ORIGINAL, 1
             )
             stats.subagent_turn += 1
     if SAND_MODE_RELAX_MARKER in next_content:
@@ -1274,9 +1766,7 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
             )
             stats.subagent_turn += 1
     if SUBAGENT_TURN_N_NEW in next_content:
-        next_content = next_content.replace(
-            SUBAGENT_TURN_N_NEW, SUBAGENT_TURN_N_OLD, 1
-        )
+        next_content = next_content.replace(SUBAGENT_TURN_N_NEW, SUBAGENT_TURN_N_OLD, 1)
         stats.subagent_turn += 1
     if SAND_CLIENT_SIDE_SUBAGENT_MARKER in next_content:
         if CLIENT_SIDE_SUBAGENT_PATCHED in next_content:
@@ -1296,6 +1786,45 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
                 MAX_TOKENS_PATCHED, MAX_TOKENS_ORIGINAL, 1
             )
             stats.task_tool += 1
+    if SAND_TTFT_MARKER in next_content:
+        next_content, ttft_count = TTFT_RESTORE_RE.subn(
+            lambda match: match.group(1) + "=1e4",
+            next_content,
+            count=1,
+        )
+        stats.ttft += ttft_count
+    if SAND_RULES_SKILLS_MARKER in next_content:
+        if RULES_SKILLS_EXEC_PATCHED in next_content:
+            next_content = next_content.replace(
+                RULES_SKILLS_EXEC_PATCHED, RULES_SKILLS_EXEC_ORIGINAL, 1
+            )
+            stats.rules_skills += 1
+    next_content, _legacy_ok, legacy_removed = _strip_legacy_rules_skills(next_content)
+    stats.rules_skills += legacy_removed
+    if SAND_USER_RULES_MARKER in next_content:
+        next_content, user_rules_count = USER_RULES_PATCHED_RE.subn(
+            lambda match: (
+                "injectLocalModeNonFileRules(e){if(!"
+                + match.group("flags")
+                + ".localMode)return;"
+            ),
+            next_content,
+            count=1,
+        )
+        stats.user_rules += user_rules_count
+    if SAND_MCP_FILESYSTEM_MARKER in next_content:
+        if MCP_FILESYSTEM_PATCHED in next_content:
+            next_content = next_content.replace(
+                MCP_FILESYSTEM_PATCHED, MCP_FILESYSTEM_ORIGINAL, 1
+            )
+            stats.mcp_filesystem += 1
+    if SAND_INTERACTION_SEQ_MARKER in next_content:
+        next_content, seq_count = INTERACTION_SEQ_PATCHED_RE.subn(
+            lambda match: _interaction_seq_original(match.group("awaiter")),
+            next_content,
+            count=1,
+        )
+        stats.interaction_seq += seq_count
     return next_content, stats
 
 
@@ -1348,8 +1877,8 @@ def _update_extension_hashes(
             continue
         digest = hashlib.sha256(next_main).hexdigest()
         pattern = re.compile(
-            rf'(\"{re.escape(extension_id)}\"\s*:\s*\{{[\s\S]{{0,2400}}?'
-            rf'\"main\.js\"\s*:\s*\")[0-9a-f]{{64}}(\")'
+            rf"(\"{re.escape(extension_id)}\"\s*:\s*\{{[\s\S]{{0,2400}}?"
+            rf"\"main\.js\"\s*:\s*\")[0-9a-f]{{64}}(\")"
         )
         next_content, count = pattern.subn(
             lambda match: match.group(1) + digest + match.group(2),
@@ -1417,6 +1946,55 @@ def _sync_product_checksums(
     )
 
 
+def _sync_checksum_for_target(layout: CursorLayout, target: Path) -> None:
+    """把 product.json 里 target 对应 key 的 checksum 刷新为磁盘当前值。
+
+    用于独立补丁（ttft 等）绕过 plan 体系直接改写 out/ 下的 bundle 后，
+    同步 product.json 完整性校验，避免 Cursor 启动报 "corrupt"。
+    """
+    product_file = layout.product_json
+    raw = product_file.read_bytes()
+    has_bom = raw.startswith(b"\xef\xbb\xbf")
+    try:
+        product = json.loads(raw.decode("utf-8-sig"))
+    except Exception as exc:
+        raise SandToolError("product.json 无法解析，无法同步 checksum") from exc
+    if not isinstance(product, dict):
+        return
+    checksums = product.get("checksums")
+    if not isinstance(checksums, dict):
+        return
+
+    out_root = (layout.app_root / "out").resolve()
+    if not _is_within(target, out_root):
+        return
+    resolved_target = target.resolve()
+    changed = False
+    for key in list(checksums.keys()):
+        if not isinstance(key, str):
+            continue
+        parts = [part for part in re.split(r"[\\/]", key) if part]
+        candidate = out_root.joinpath(*parts).resolve()
+        if candidate != resolved_target:
+            continue
+        digest = _product_checksum(target.read_bytes())
+        if checksums.get(key) != digest:
+            checksums[key] = digest
+            changed = True
+    if not changed:
+        return
+
+    text = json.dumps(product, ensure_ascii=False, indent="\t")
+    next_bytes = text.encode("utf-8")
+    if has_bom:
+        next_bytes = b"\xef\xbb\xbf" + next_bytes
+    _atomic_write(
+        product_file,
+        next_bytes,
+        stat.S_IMODE(product_file.stat().st_mode),
+    )
+
+
 def _planned_extension_names(
     layout: CursorLayout,
     plan: Mapping[Path, PlannedFile],
@@ -1447,8 +2025,8 @@ def _verify_extension_hashes(
         if f'"{extension_id}"' not in ext_content:
             continue
         pattern = re.compile(
-            rf'\"{re.escape(extension_id)}\"\s*:\s*\{{[\s\S]{{0,2400}}?'
-            rf'\"main\.js\"\s*:\s*\"([0-9a-f]{{64}})\"'
+            rf"\"{re.escape(extension_id)}\"\s*:\s*\{{[\s\S]{{0,2400}}?"
+            rf"\"main\.js\"\s*:\s*\"([0-9a-f]{{64}})\""
         )
         match = pattern.search(ext_content)
         if not match:
@@ -1483,13 +2061,22 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
     eligibility_markers = 0
     managed_local_route_markers = 0
     local_runtime_load_markers = 0
+    session_stream_markers = 0
     direct_stream_markers = 0
+    dsv3_local_loop_markers = 0
     agent_host_enablement_markers = 0
     agent_host_identity_markers = 0
     move_exec_markers = 0
     task_tool_markers = 0
     client_side_subagent_markers = 0
     subagent_turn_markers = 0
+    ttft_markers = 0
+    rules_skills_markers = 0
+    rules_skills_legacy_markers = 0
+    dsv3_legacy_markers = 0
+    user_rules_markers = 0
+    mcp_filesystem_markers = 0
+    interaction_seq_markers = 0
     legacy_client_markers = 0
     legacy_eligibility_markers = 0
     ide_matches = 0
@@ -1504,21 +2091,30 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         eligibility_count = content.count(SAND_ELIGIBILITY_MARKER)
         managed_local_route_count = content.count(SAND_MANAGED_LOCAL_ROUTE_MARKER)
         local_runtime_load_count = content.count(SAND_LOCAL_RUNTIME_LOAD_MARKER)
+        session_stream_count = content.count(SAND_SESSION_STREAM_MARKER)
         direct_stream_count = content.count(SAND_DIRECT_STREAM_MARKER)
-        agent_host_enablement_count = content.count(
-            SAND_AGENT_HOST_ENABLEMENT_MARKER
-        )
-        agent_host_identity_count = content.count(
-            SAND_AGENT_HOST_IDENTITY_MARKER
-        )
+        dsv3_local_loop_count = content.count(SAND_DSV3_DEGRADE_MARKER)
+        dsv3_legacy_count = content.count(SAND_DSV3_LOCAL_LOOP_MARKER_V1)
+        user_rules_count = content.count(SAND_USER_RULES_MARKER)
+        mcp_filesystem_count = content.count(SAND_MCP_FILESYSTEM_MARKER)
+        interaction_seq_count = content.count(SAND_INTERACTION_SEQ_MARKER)
+        agent_host_enablement_count = content.count(SAND_AGENT_HOST_ENABLEMENT_MARKER)
+        agent_host_identity_count = content.count(SAND_AGENT_HOST_IDENTITY_MARKER)
         move_exec_count = content.count(SAND_MOVE_EXEC_MARKER)
         task_tool_count = content.count(SAND_TASK_TOOL_MARKER)
-        client_side_subagent_count = content.count(
-            SAND_CLIENT_SIDE_SUBAGENT_MARKER
+        client_side_subagent_count = content.count(SAND_CLIENT_SIDE_SUBAGENT_MARKER)
+        subagent_turn_count = (
+            content.count(SAND_SUBAGENT_TURN_MARKER)
+            + content.count(SAND_SUBAGENT_FOLLOWUP_MARKER)
+            + content.count(SAND_PLAN_BUILD_MARKER)
         )
-        subagent_turn_count = content.count(
-            SAND_SUBAGENT_TURN_MARKER
-        ) + content.count(SAND_SUBAGENT_FOLLOWUP_MARKER)
+        ttft_count = content.count(SAND_TTFT_MARKER)
+        rules_skills_count = content.count(SAND_RULES_SKILLS_MARKER)
+        rules_skills_legacy_count = (
+            content.count(SAND_RULES_SKILLS_MARKER_V1)
+            + content.count(SAND_RULES_SKILLS_MARKER_V2)
+            + content.count(SAND_RULES_SKILLS_MARKER_V3)
+        )
         legacy_client_count = len(
             re.findall(
                 rf"([\"'])sand\1{LEGACY_CLIENT_MARKER_PATTERN}",
@@ -1547,13 +2143,22 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
             + legacy_eligibility_count
             + managed_local_route_count
             + local_runtime_load_count
+            + session_stream_count
             + direct_stream_count
+            + dsv3_local_loop_count
             + agent_host_enablement_count
             + agent_host_identity_count
             + move_exec_count
             + task_tool_count
             + client_side_subagent_count
             + subagent_turn_count
+            + ttft_count
+            + rules_skills_count
+            + rules_skills_legacy_count
+            + dsv3_legacy_count
+            + user_rules_count
+            + mcp_filesystem_count
+            + interaction_seq_count
         ):
             patched_files.append(target)
         client_markers += client_count
@@ -1562,13 +2167,22 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         legacy_eligibility_markers += legacy_eligibility_count
         managed_local_route_markers += managed_local_route_count
         local_runtime_load_markers += local_runtime_load_count
+        session_stream_markers += session_stream_count
         direct_stream_markers += direct_stream_count
+        dsv3_local_loop_markers += dsv3_local_loop_count
+        dsv3_legacy_markers += dsv3_legacy_count
+        user_rules_markers += user_rules_count
+        mcp_filesystem_markers += mcp_filesystem_count
+        interaction_seq_markers += interaction_seq_count
         agent_host_enablement_markers += agent_host_enablement_count
         agent_host_identity_markers += agent_host_identity_count
         move_exec_markers += move_exec_count
         task_tool_markers += task_tool_count
         client_side_subagent_markers += client_side_subagent_count
         subagent_turn_markers += subagent_turn_count
+        ttft_markers += ttft_count
+        rules_skills_markers += rules_skills_count
+        rules_skills_legacy_markers += rules_skills_legacy_count
         for _key, rule in CLIENT_RULES:
             for match in rule.finditer(content):
                 if match.group(3) == "sand":
@@ -1586,13 +2200,22 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         patched_files=tuple(patched_files),
         managed_local_route_markers=managed_local_route_markers,
         local_runtime_load_markers=local_runtime_load_markers,
+        session_stream_markers=session_stream_markers,
         direct_stream_markers=direct_stream_markers,
+        dsv3_local_loop_markers=dsv3_local_loop_markers,
         agent_host_enablement_markers=agent_host_enablement_markers,
         agent_host_identity_markers=agent_host_identity_markers,
         move_exec_markers=move_exec_markers,
         task_tool_markers=task_tool_markers,
         client_side_subagent_markers=client_side_subagent_markers,
         subagent_turn_markers=subagent_turn_markers,
+        ttft_markers=ttft_markers,
+        rules_skills_markers=rules_skills_markers,
+        rules_skills_legacy_markers=rules_skills_legacy_markers,
+        dsv3_legacy_markers=dsv3_legacy_markers,
+        user_rules_markers=user_rules_markers,
+        mcp_filesystem_markers=mcp_filesystem_markers,
+        interaction_seq_markers=interaction_seq_markers,
     )
 
 
@@ -1700,8 +2323,7 @@ def _commit_plan(
             pass
         if rollback_errors:
             raise SandToolError(
-                "补丁失败且有文件未能自动回滚，请保留备份目录："
-                f"{backup_dir}\n{message}"
+                f"补丁失败且有文件未能自动回滚，请保留备份目录：{backup_dir}\n{message}"
             ) from exc
         raise
 
@@ -1746,7 +2368,14 @@ Write-Output ("CLOSED=" + $before.Count)
     env["SAND_CURSOR_EXE"] = str(layout.executable)
     try:
         result = subprocess.run(
-            [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+            [
+                powershell,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1758,9 +2387,7 @@ Write-Output ("CLOSED=" + $before.Count)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SandToolError("无法安全关闭所选 Cursor 进程，请手动退出后重试") from exc
     if result.returncode != 0:
-        raise SandToolError(
-            "无法安全关闭所选 Cursor 进程，请手动退出后重试"
-        )
+        raise SandToolError("无法安全关闭所选 Cursor 进程，请手动退出后重试")
     match = re.search(r"CLOSED=(\d+)", result.stdout)
     return int(match.group(1)) if match else 0
 
@@ -1930,9 +2557,7 @@ def cmd_move_exec_restore(layout: CursorLayout) -> int:
     backup_file = _config_dir() / "move_exec_backup" / "main.js"
     if backup_file.exists():
         close_cursor(layout)
-        _atomic_write(
-            path, backup_file.read_bytes(), stat.S_IMODE(path.stat().st_mode)
-        )
+        _atomic_write(path, backup_file.read_bytes(), stat.S_IMODE(path.stat().st_mode))
         print("[move-exec] 已从备份还原")
         start_cursor(layout)
         return 0
@@ -1948,15 +2573,192 @@ def cmd_move_exec_restore(layout: CursorLayout) -> int:
     return 1
 
 
+def _ttft_workbench_js(layout: CursorLayout) -> Path:
+    return layout.app_root / "out" / "vs" / "workbench" / "workbench.desktop.main.js"
+
+
+def ttft_state(layout: CursorLayout) -> Tuple[bool, bool, int]:
+    path = _ttft_workbench_js(layout)
+    if not path.is_file():
+        return False, False, 0
+    content = _decode_js(path.read_bytes(), path)
+    return (
+        SAND_TTFT_MARKER in content,
+        any(original in content for original in TTFT_ORIGINALS),
+        sum(content.count(original) for original in TTFT_ORIGINALS),
+    )
+
+
+def _ttft_checksum_record(layout: CursorLayout) -> Optional[str]:
+    """返回 product.json 里 workbench.desktop.main.js 对应的记录值；不存在返回 None。"""
+    try:
+        product = json.loads(layout.product_json.read_bytes().decode("utf-8-sig"))
+    except Exception:
+        return None
+    checksums = product.get("checksums") if isinstance(product, dict) else None
+    if not isinstance(checksums, dict):
+        return None
+    out_root = (layout.app_root / "out").resolve()
+    resolved_target = _ttft_workbench_js(layout).resolve()
+    for key, value in checksums.items():
+        if not isinstance(key, str):
+            continue
+        parts = [part for part in re.split(r"[\\/]", key) if part]
+        candidate = out_root.joinpath(*parts).resolve()
+        if candidate == resolved_target:
+            return str(value)
+    return None
+
+
+def ttft_checksum_ok(layout: CursorLayout) -> bool:
+    """product.json 的 checksum 是否与磁盘上的 workbench.desktop.main.js 一致。"""
+    path = _ttft_workbench_js(layout)
+    if not path.is_file():
+        return True
+    recorded = _ttft_checksum_record(layout)
+    if recorded is None:
+        return True
+    actual = _product_checksum(path.read_bytes())
+    return recorded == actual
+
+
+def cmd_ttft_check(layout: CursorLayout) -> int:
+    patched, original, count = ttft_state(layout)
+    print(f"[ttft] 文件: {_ttft_workbench_js(layout)}")
+    if patched:
+        print("[ttft] 结论: 首字超时已 1s（已补丁）")
+    elif original:
+        print(f"[ttft] 结论: 首字超时仍 10s（未补丁，命中 {count} 处）")
+    else:
+        print("[ttft] 结论: 未匹配到目标代码（版本不同？）")
+    if not ttft_checksum_ok(layout):
+        print(
+            "[ttft] 警告: product.json 校验和与文件不一致，"
+            "Cursor 可能报安装损坏；请运行 ttft-sync 修复"
+        )
+    return 0
+
+
+def cmd_ttft_sync(layout: CursorLayout) -> int:
+    """幂等同步 product.json 的 checksum 为磁盘当前值，修复 corrupt。"""
+    path = _ttft_workbench_js(layout)
+    if not path.is_file():
+        print("[ttft] 目标文件不存在，跳过")
+        return 1
+    if ttft_checksum_ok(layout):
+        print("[ttft] 校验和已一致，无需同步")
+        return 0
+    recorded = _ttft_checksum_record(layout)
+    actual = _product_checksum(path.read_bytes())
+    _sync_checksum_for_target(layout, path)
+    print(f"[ttft] 已同步校验和: {recorded} -> {actual}")
+    return 0
+
+
+def cmd_ttft_apply(layout: CursorLayout) -> int:
+    patched, original, count = ttft_state(layout)
+    if patched:
+        print("[ttft] 已补丁，跳过")
+        return 0
+    if not original:
+        print("[ttft] 错误: 未找到目标代码，无法补丁（版本不同？）")
+        return 1
+    if count != 1:
+        print(
+            f"[ttft] 错误: 目标代码出现 {count} 处，不唯一，拒绝补丁"
+            "（版本改版？请重新确认锚点）"
+        )
+        return 1
+    path = _ttft_workbench_js(layout)
+    close_cursor(layout)
+    content = _decode_js(path.read_bytes(), path)
+    matched = next(o for o in TTFT_ORIGINALS if o in content)
+    patched_text = matched.replace("=1e4", "=1e3") + SAND_TTFT_MARKER
+    content = content.replace(matched, patched_text, 1)
+    _atomic_write(path, content.encode("utf-8"), stat.S_IMODE(path.stat().st_mode))
+    _sync_checksum_for_target(layout, path)
+    print(f"[ttft] 补丁完成: 首字超时已从 10s 改为 1s（锚点 {matched}）")
+    start_cursor(layout)
+    return 0
+
+
+def cmd_ttft_restore(layout: CursorLayout) -> int:
+    patched, _original, _count = ttft_state(layout)
+    if not patched:
+        print("[ttft] 未打补丁，跳过")
+        return 0
+    path = _ttft_workbench_js(layout)
+    content = _decode_js(path.read_bytes(), path)
+    if not TTFT_RESTORE_RE.search(content):
+        print("[ttft] 错误: 找不到补丁串，拒绝还原（避免整文件覆盖其它补丁）")
+        return 1
+    close_cursor(layout)
+    content = TTFT_RESTORE_RE.sub(lambda m: m.group(1) + "=1e4", content, count=1)
+    _atomic_write(path, content.encode("utf-8"), stat.S_IMODE(path.stat().st_mode))
+    _sync_checksum_for_target(layout, path)
+    print("[ttft] 已反向替换还原")
+    start_cursor(layout)
+    return 0
+
+
+def _rules_skills_exec_js(layout: CursorLayout) -> Path:
+    return layout.app_root / "extensions" / "cursor-agent-exec" / "dist" / "main.js"
+
+
+def rules_skills_state(layout: CursorLayout) -> Tuple[bool, bool, int, int]:
+    """返回 (已打 V4, 存在 aa() 锚点, 锚点次数, 旧版 V1–V3 标记数)。"""
+    path = _rules_skills_exec_js(layout)
+    host = layout.app_root / "extensions" / "cursor-agent-host" / "dist" / "main.js"
+    exec_content = _decode_js(path.read_bytes(), path) if path.is_file() else ""
+    host_content = _decode_js(host.read_bytes(), host) if host.is_file() else ""
+    legacy = (
+        exec_content.count(SAND_RULES_SKILLS_MARKER_V1)
+        + exec_content.count(SAND_RULES_SKILLS_MARKER_V2)
+        + exec_content.count(SAND_RULES_SKILLS_MARKER_V3)
+        + host_content.count(SAND_RULES_SKILLS_MARKER_V1)
+        + host_content.count(SAND_RULES_SKILLS_MARKER_V2)
+        + host_content.count(SAND_RULES_SKILLS_MARKER_V3)
+    )
+    if not path.is_file():
+        return False, False, 0, legacy
+    return (
+        SAND_RULES_SKILLS_MARKER in exec_content,
+        RULES_SKILLS_EXEC_ORIGINAL in exec_content,
+        exec_content.count(RULES_SKILLS_EXEC_ORIGINAL),
+        legacy,
+    )
+
+
+def cmd_rules_skills_check(layout: CursorLayout) -> int:
+    patched, original, count, legacy = rules_skills_state(layout)
+    print(f"[rules-skills] 文件: {_rules_skills_exec_js(layout)}")
+    if patched:
+        print("[rules-skills] 结论: 已补调 agent-exec aa()→na()（V4）")
+    elif legacy:
+        print("[rules-skills] 结论: 检测到旧版 V1–V3 残留，请重新 install")
+        return 1
+    elif original and count == 1:
+        print("[rules-skills] 结论: 未补丁（host 启用时 rules/skills 不会推送）")
+    elif original:
+        print(f"[rules-skills] 结论: 锚点出现 {count} 处，不唯一（版本改版？）")
+        return 1
+    else:
+        print("[rules-skills] 结论: 未匹配到目标代码（版本不同？）")
+        return 1
+    return 0
+
+
 def _build_install_plan(
     layout: CursorLayout,
+    transport: str = STREAM_TRANSPORT_SESSION,
 ) -> Tuple[Dict[Path, PlannedFile], PatchStats]:
     plan: Dict[Path, PlannedFile] = {}
     total = PatchStats()
+    transport = _validate_stream_transport(transport)
     for target in layout.target_paths:
         original = _read_planned_file(target)
         content = _decode_js(original.original, target)
-        next_content, stats = apply_patch_to_content(content)
+        next_content, stats = apply_patch_to_content(content, transport)
         if next_content != content:
             plan[target] = PlannedFile(
                 original=original.original,
@@ -1972,13 +2774,20 @@ def _build_install_plan(
         total.migrated_eligibility += stats.migrated_eligibility
         total.managed_local_route += stats.managed_local_route
         total.local_runtime_load += stats.local_runtime_load
+        total.session_stream += stats.session_stream
         total.direct_stream += stats.direct_stream
+        total.dsv3_local_loop += stats.dsv3_local_loop
         total.agent_host_enablement += stats.agent_host_enablement
         total.agent_host_identity += stats.agent_host_identity
         total.move_exec += stats.move_exec
         total.task_tool += stats.task_tool
         total.client_side_subagent += stats.client_side_subagent
         total.subagent_turn += stats.subagent_turn
+        total.ttft += stats.ttft
+        total.rules_skills += stats.rules_skills
+        total.user_rules += stats.user_rules
+        total.mcp_filesystem += stats.mcp_filesystem
+        total.interaction_seq += stats.interaction_seq
     if plan:
         _update_extension_hashes(layout, plan)
         _sync_product_checksums(layout, plan)
@@ -2004,20 +2813,30 @@ def _build_uninstall_plan(
         total.eligibility += stats.eligibility
         total.managed_local_route += stats.managed_local_route
         total.local_runtime_load += stats.local_runtime_load
+        total.session_stream += stats.session_stream
         total.direct_stream += stats.direct_stream
+        total.dsv3_local_loop += stats.dsv3_local_loop
         total.agent_host_enablement += stats.agent_host_enablement
         total.agent_host_identity += stats.agent_host_identity
         total.move_exec += stats.move_exec
         total.task_tool += stats.task_tool
         total.client_side_subagent += stats.client_side_subagent
         total.subagent_turn += stats.subagent_turn
+        total.ttft += stats.ttft
+        total.rules_skills += stats.rules_skills
+        total.user_rules += stats.user_rules
+        total.mcp_filesystem += stats.mcp_filesystem
+        total.interaction_seq += stats.interaction_seq
     if plan:
         _update_extension_hashes(layout, plan)
         _sync_product_checksums(layout, plan)
     return plan, total
 
 
-def install(layout: CursorLayout) -> int:
+def install(
+    layout: CursorLayout,
+    transport: str = STREAM_TRANSPORT_SESSION,
+) -> int:
     if layout.version != SUPPORTED_CURSOR_VERSION:
         raise SandToolError(
             f"当前 Cursor 版本为 {layout.version}，"
@@ -2027,33 +2846,44 @@ def install(layout: CursorLayout) -> int:
     before = inspect_status(layout)
     if before.external_marker_count:
         raise SandToolError(
-            "检测到其他 Sand 模式标记，本脚本不会接管或覆盖它；"
-            "请先用原安装方式卸载"
+            "检测到其他 Sand 模式标记，本脚本不会接管或覆盖它；请先用原安装方式卸载"
         )
-    plan, _stats = _build_install_plan(layout)
+    transport = _validate_stream_transport(transport)
+    plan, _stats = _build_install_plan(layout, transport)
     if not plan:
-        if before.installed and before.stream_mode_installed:
+        if (
+            before.installed
+            and before.stream_mode_installed
+            and before.stream_transport == transport
+        ):
             start_cursor(layout)
             return 0
         raise SandToolError("当前 Cursor 版本未匹配到 Sand 客户端模式规则")
+    expect_session = 1 if transport == STREAM_TRANSPORT_SESSION else 0
+    expect_direct = 1 if transport == STREAM_TRANSPORT_DIRECT else 0
+    session_after = (
+        before.session_stream_markers + _stats.session_stream
+        if transport == STREAM_TRANSPORT_SESSION
+        else 0
+    )
+    direct_after = (
+        before.direct_stream_markers + _stats.direct_stream
+        if transport == STREAM_TRANSPORT_DIRECT
+        else 0
+    )
     if (
         before.managed_local_route_markers + _stats.managed_local_route != 1
-        or (
-            before.local_runtime_load_markers
-            + _stats.local_runtime_load
-            != 1
-        )
-        or (
-            before.agent_host_identity_markers
-            + _stats.agent_host_identity
-            != 1
-        )
-        or before.direct_stream_markers + _stats.direct_stream != 1
-        or (
-            before.agent_host_enablement_markers
-            + _stats.agent_host_enablement
-            != 2
-        )
+        or (before.local_runtime_load_markers + _stats.local_runtime_load != 1)
+        or (before.agent_host_identity_markers + _stats.agent_host_identity != 1)
+        or session_after != expect_session
+        or direct_after != expect_direct
+        or before.dsv3_local_loop_markers + _stats.dsv3_local_loop != 1
+        or (before.agent_host_enablement_markers + _stats.agent_host_enablement != 2)
+        or before.ttft_markers + _stats.ttft != 1
+        or before.rules_skills_markers + _stats.rules_skills != 1
+        or before.user_rules_markers + _stats.user_rules != 1
+        or before.mcp_filesystem_markers + _stats.mcp_filesystem != 1
+        or before.interaction_seq_markers + _stats.interaction_seq != 1
     ):
         raise SandToolError(
             "当前 Cursor 版本未完整匹配 Sand Stream 规则："
@@ -2062,10 +2892,16 @@ def install(layout: CursorLayout) -> int:
             f"{before.local_runtime_load_markers + _stats.local_runtime_load}, "
             "identity="
             f"{before.agent_host_identity_markers + _stats.agent_host_identity}, "
-            "directStream="
-            f"{before.direct_stream_markers + _stats.direct_stream}, "
+            f"sessionStream={before.session_stream_markers + _stats.session_stream}, "
+            f"directStream={before.direct_stream_markers + _stats.direct_stream}, "
+            f"dsv3={before.dsv3_local_loop_markers + _stats.dsv3_local_loop}, "
             "agentHost="
-            f"{before.agent_host_enablement_markers + _stats.agent_host_enablement}"
+            f"{before.agent_host_enablement_markers + _stats.agent_host_enablement}, "
+            f"ttft={before.ttft_markers + _stats.ttft}, "
+            f"rulesSkills={before.rules_skills_markers + _stats.rules_skills}, "
+            f"userRules={before.user_rules_markers + _stats.user_rules}, "
+            f"mcpFs={before.mcp_filesystem_markers + _stats.mcp_filesystem}, "
+            f"interactionSeq={before.interaction_seq_markers + _stats.interaction_seq}"
         )
 
     close_cursor(layout)
@@ -2076,18 +2912,36 @@ def install(layout: CursorLayout) -> int:
         if (
             not status.installed
             or not status.stream_mode_installed
+            or status.stream_transport != transport
             or status.ide_matches != 0
             or status.external_marker_count != 0
             or status.legacy_client_markers != 0
             or status.legacy_eligibility_markers != 0
+            or status.dsv3_local_loop_markers != 1
+            or status.dsv3_legacy_markers != 0
+            or status.ttft_markers != 1
+            or status.rules_skills_markers != 1
+            or status.rules_skills_legacy_markers != 0
+            or status.user_rules_markers != 1
+            or status.mcp_filesystem_markers != 1
+            or status.interaction_seq_markers != 1
         ):
             raise SandToolError(
                 "安装后状态校验失败："
                 f"markers={status.client_markers + status.eligibility_markers}, "
                 f"remainingIde={status.ide_matches}, "
                 f"streamMode={status.stream_mode_installed}, "
+                f"transport={status.stream_transport}, "
+                f"dsv3={status.dsv3_local_loop_markers}, "
+                f"dsv3Legacy={status.dsv3_legacy_markers}, "
                 "remainingLegacy="
-                f"{status.legacy_client_markers + status.legacy_eligibility_markers}"
+                f"{status.legacy_client_markers + status.legacy_eligibility_markers}, "
+                f"ttft={status.ttft_markers}, "
+                f"rulesSkills={status.rules_skills_markers}, "
+                f"rulesSkillsLegacy={status.rules_skills_legacy_markers}, "
+                f"userRules={status.user_rules_markers}, "
+                f"mcpFs={status.mcp_filesystem_markers}, "
+                f"interactionSeq={status.interaction_seq_markers}"
             )
         _verify_extension_hashes(layout, changed_extensions)
         _verify_product_checksums(layout)
@@ -2102,8 +2956,7 @@ def uninstall(layout: CursorLayout) -> int:
     before = inspect_status(layout)
     if before.external_marker_count:
         raise SandToolError(
-            "检测到无法识别的 Sand 模式标记，拒绝修改；"
-            "请先用原安装方式卸载"
+            "检测到无法识别的 Sand 模式标记，拒绝修改；请先用原安装方式卸载"
         )
     plan, _stats = _build_uninstall_plan(layout)
     if not plan:
@@ -2144,20 +2997,36 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "示例：\n"
             "  python sand_stream_installer.py install\n"
+            "  python sand_stream_installer.py install --transport direct\n"
             "  python sand_stream_installer.py uninstall\n"
-            "  python sand_stream_installer.py set-path \"E:\\Development\\IDE\\cursor\"\n"
+            '  python sand_stream_installer.py set-path "E:\\Development\\IDE\\cursor"\n'
             "  python3 sand_stream_installer.py set-path /Applications/Cursor.app\n"
             "  python sand_stream_installer.py set-path auto"
         ),
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {TOOL_VERSION}")
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {TOOL_VERSION}"
+    )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("install", help="安装/注入 Sand 客户端模式")
+    install_parser = commands.add_parser("install", help="安装/注入 Sand 客户端模式")
+    install_parser.add_argument(
+        "--transport",
+        choices=STREAM_TRANSPORTS,
+        default=STREAM_TRANSPORT_SESSION,
+        help="推理传输：session 复用原生会话流（默认，网页 Usage 走 bot）；direct 旧版直连回退",
+    )
     commands.add_parser("uninstall", help="卸载 Sand 客户端模式")
     commands.add_parser("move-exec-check", help="检查 move_exec 补丁状态")
     commands.add_parser("move-exec-apply", help="单独应用 move_exec 补丁")
     commands.add_parser("move-exec-restore", help="单独还原 move_exec 补丁")
-    set_path = commands.add_parser("set-path", help="设置 Cursor 路径；auto 恢复自动检测")
+    commands.add_parser("ttft-check", help="检查首字(TTFT)超时补丁状态")
+    commands.add_parser("ttft-apply", help="应用首字(TTFT)超时优化（10s → 1s）")
+    commands.add_parser("ttft-restore", help="还原首字(TTFT)超时优化")
+    commands.add_parser("ttft-sync", help="同步 product.json 校验和（修复 corrupt）")
+    commands.add_parser("rules-skills-check", help="检查 Rules/Skills 恢复补丁状态")
+    set_path = commands.add_parser(
+        "set-path", help="设置 Cursor 路径；auto 恢复自动检测"
+    )
     set_path.add_argument(
         "path",
         help="Cursor.exe、Cursor.app、resources/app、安装根目录，或 auto",
@@ -2185,7 +3054,8 @@ def collect_status_lines() -> List[Tuple[str, str]]:
         )
     if status.installed:
         if status.stream_mode_installed:
-            lines.append(("[状态] Stream 模式已启用", ANSI_GREEN))
+            label = _stream_transport_label(status.stream_transport)
+            lines.append((f"[状态] Stream 模式已启用（{label}）", ANSI_GREEN))
         else:
             lines.append(("[状态] 检测到旧版客户端模式", ANSI_YELLOW))
     else:
@@ -2194,13 +3064,57 @@ def collect_status_lines() -> List[Tuple[str, str]]:
         lines.append(("[move-exec] 工具执行补丁已启用", ANSI_GREEN))
     elif status.installed:
         lines.append(("[move-exec] 工具执行补丁未启用", ANSI_YELLOW))
-    if status.task_tool_markers and status.client_side_subagent_markers and status.subagent_turn_markers:
+    ttft_patched, ttft_original, _ttft_count = ttft_state(layout)
+    if ttft_patched:
+        lines.append(("[ttft] 首字超时已 1s（已补丁）", ANSI_GREEN))
+    elif ttft_original:
+        lines.append(("[ttft] 首字超时仍 10s（未补丁）", ANSI_YELLOW))
+    if not ttft_checksum_ok(layout):
+        lines.append(("[ttft] 校验和失配，请运行 ttft-sync 修复", ANSI_RED))
+    if status.rules_skills_markers:
+        lines.append(("[rules-skills] Rules/Skills 恢复已启用", ANSI_GREEN))
+    elif status.rules_skills_legacy_markers:
+        lines.append(("[rules-skills] 旧版补丁残留，请重新 install", ANSI_RED))
+    elif status.installed:
+        lines.append(("[rules-skills] Rules/Skills 恢复未启用", ANSI_YELLOW))
+    if status.user_rules_markers:
+        lines.append(("[user-rules] Settings User Rules 注入已启用", ANSI_GREEN))
+    elif status.installed:
+        lines.append(
+            ("[user-rules] Settings User Rules 注入未启用，请重新 install", ANSI_YELLOW)
+        )
+    if status.mcp_filesystem_markers:
+        lines.append(("[mcp] MCP FileSystem 提示块已启用", ANSI_GREEN))
+    elif status.installed:
+        lines.append(("[mcp] MCP 提示块未启用，请重新 install", ANSI_YELLOW))
+    if status.interaction_seq_markers:
+        lines.append(
+            ("[plan-fix] 同 turn 多次交互（问答→建计划）串号修复已启用", ANSI_GREEN)
+        )
+    elif status.installed:
+        lines.append(("[plan-fix] 交互串号修复未启用，请重新 install", ANSI_YELLOW))
+    if status.dsv3_legacy_markers:
+        lines.append(("[dsv3] 旧版 V1 守卫补丁残留，请重新 install", ANSI_RED))
+    elif status.dsv3_local_loop_markers:
+        lines.append(
+            ("[dsv3] Composer/Auto/grok-4.6 已降级到通用 harness（V2）", ANSI_GREEN)
+        )
+    elif status.installed:
+        lines.append(("[dsv3] DSV3 模型降级未启用，请重新 install", ANSI_YELLOW))
+    if (
+        status.task_tool_markers
+        and status.client_side_subagent_markers
+        and status.subagent_turn_markers
+    ):
         lines.append(("[subagent] 子 agent（Task）已启用", ANSI_GREEN))
     elif status.installed:
         lines.append(("[subagent] 子 agent（Task）未启用", ANSI_YELLOW))
     if status.external_marker_count:
         lines.append(
-            (f"[注意] 检测到其他工具标记：{status.external_marker_count} 处", ANSI_YELLOW)
+            (
+                f"[注意] 检测到其他工具标记：{status.external_marker_count} 处",
+                ANSI_YELLOW,
+            )
         )
     return lines
 
@@ -2213,7 +3127,6 @@ def print_banner() -> None:
     print(colorize("=" * width, ANSI_BLUE))
     for text, code in collect_status_lines():
         print(colorize(text, code))
-    print(colorize("[账号] 请使用已开通 Sand 资格的 Cursor 账号", ANSI_YELLOW))
     print()
 
 
@@ -2244,7 +3157,7 @@ def run_choice(choice: str) -> Optional[int]:
     if choice == "1":
         with LoadingSpinner("正在启用 Stream 模式"):
             result = install(resolve_cursor_layout())
-        print_success("✓ Stream 模式已启用，Cursor 已重新启动")
+        print_success("✓ Stream 模式已启用（会话流），Cursor 已重新启动")
         return result
     if choice == "2":
         with LoadingSpinner("正在恢复 Cursor 原版"):
@@ -2301,8 +3214,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         layout = resolve_cursor_layout()
         if args.command == "install":
-            result = install(layout)
-            print_success("✓ Stream 模式已启用，Cursor 已重新启动")
+            result = install(layout, args.transport)
+            label = _stream_transport_label(args.transport)
+            print_success(f"✓ Stream 模式已启用（{label}），Cursor 已重新启动")
             return result
         if args.command == "uninstall":
             result = uninstall(layout)
@@ -2314,6 +3228,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return cmd_move_exec_apply(layout)
         if args.command == "move-exec-restore":
             return cmd_move_exec_restore(layout)
+        if args.command == "ttft-check":
+            return cmd_ttft_check(layout)
+        if args.command == "ttft-apply":
+            return cmd_ttft_apply(layout)
+        if args.command == "ttft-restore":
+            return cmd_ttft_restore(layout)
+        if args.command == "ttft-sync":
+            return cmd_ttft_sync(layout)
+        if args.command == "rules-skills-check":
+            return cmd_rules_skills_check(layout)
         raise SandToolError(f"未知命令：{args.command}")
     except PermissionError as exc:
         print_error(f"错误：没有写入权限：{exc}")
