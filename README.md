@@ -141,7 +141,7 @@ V4 只解决「推送链路没跑」。Context Usage 里 **Rules** 分类还需�
 - **User Rules**（Settings → Rules → User Rules，例如「Always respond in 中文」）：属于「非文件规则」，
   云端链路由服务端拼进 prompt；managed-local 本地拼 prompt 时，workbench 的
   `injectLocalModeNonFileRules` 只在 `localMode` 才把它们并进 `requestContext.rules`，
-  所以之前 sand 模式下永远进不了 prompt。`1.5.8` 打掉这个守卫（`/*SAND_USER_RULES_V1*/`），
+  所以之前 sand 模式下永远进不了 prompt。`1.5.4` 打掉这个守卫（`/*SAND_USER_RULES_V1*/`），
   User / Team rules 现在也会随本地 prompt 一起发出。
 
 ## MCP 不见了（Context Usage 里没有「MCP & dynamic tools」）
@@ -165,7 +165,7 @@ descriptors 非空，提示块就会照常进 prompt——判据本来就来自�
 根因在 `cursor-agent-host/dist/657.js`：interaction registry 用 `${turnId}:${query.id}` 做 key，
 而本地 loop 构造 `InteractionQuery` 时从不填 `id`（uint32，恒为 0）。同一 turn 的第二个交互直接命中
 第一个已缓存的应答。官方在 `queryFromChild` / `querySurfacedForSubagent` 里都补了 `seq`，唯独主会话的
-`query` 漏了。`1.5.8` 给主会话 `query` 同样加上递增 `seq`（`/*SAND_INTERACTION_SEQ_V1*/`）。
+`query` 漏了。`1.5.4` 给主会话 `query` 同样加上递增 `seq`（`/*SAND_INTERACTION_SEQ_V1*/`）。
 
 ## Composer / Auto / grok-4.6（DSV3 harness）
 
@@ -175,7 +175,7 @@ descriptors 非空，提示块就会照常进 prompt——判据本来就来自�
 
 - 从 3.18.25 fork 移植的 V1 只是屏蔽了那个守卫，请求继续往下走，到 `doe()` 里抛
   `Tools for dsv3-1018 are handled in dsv31018ToolsGenerator`，还要重试 3 次（约 20s）才报错。
-- `1.5.8` 换成 V2（`/*SAND_DSV3_DEGRADE_V2*/`）：在元数据解析处把 `promptVersion` 降级成 `latest`
+- `1.5.4` 换成 V2（`/*SAND_DSV3_DEGRADE_V2*/`）：在元数据解析处把 `promptVersion` 降级成 `latest`
   通用 harness、`useDsv3Harness` 置 false，官方守卫原样保留。这正是旧版直连流下 grok 能跑的那条路。
 - **能不能跑通取决于服务端是否接受通用 prompt**：grok-4.6 在直连流时代已验证可用；Composer / Auto
   属于试跑，若服务端拒绝会直接报服务端错误。日常仍建议 claude 系列。
@@ -189,7 +189,7 @@ descriptors 非空，提示块就会照常进 prompt——判据本来就来自�
 | **Included + 几十万** 小块 | 直连流自建 `Joe` session，绕开官方 `runInference`，按普通 IDE 记账 |
 | **free + 1000 万+**        | 会话流只打标记，走原生会话计费链，记到 sand/bot 额度               |
 
-`1.5.7` 起默认 `--transport session`（与 3.18.25 上 1.7.3 同一修法）。旧版直连若网页 Usage 异常，重跑一次 `install` 即可切到会话流。`--transport direct` 只作兼容回退。
+`1.5.4` 起默认 `--transport session`（与 3.18.25 上 1.7.3 同一修法）。旧版直连若网页 Usage 异常，重跑一次 `install` 即可切到会话流。`--transport direct` 只作兼容回退。
 
 ## 免责声明
 
