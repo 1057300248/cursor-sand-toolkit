@@ -25,6 +25,7 @@ Cursor 客户端模式管理器 —— 伪装 sand 计费到 bot，并绕过后�
 | MCP 恢复          | agent 重新看得到已连接的 MCP server                              |
 | Plan 交互修复     | 同一 turn 先提问再建计划不再报错                                 |
 | DSV3 模型降级     | Composer / Auto / grok-4.6 可试跑，不再干等 20s 报错             |
+| 机器码伪装        | 不再上传真实硬件 UUID / MAC / devDeviceId；假身份持久化，uninstall 也不会还原 |
 
 ## 前提
 
@@ -92,6 +93,8 @@ SmartScreen 提示时点「更多信息 → 仍要运行」。
 ./cursor-sand-toolkit ttft-sync             # 同步 product.json 校验和（修复「安装已损坏」）
 
 ./cursor-sand-toolkit rules-skills-check    # 检查 Rules/Skills 恢复补丁
+
+./cursor-sand-toolkit machine-id-check      # 检查机器码伪装
 ```
 
 不带参数运行会打印当前状态：Cursor 版本与路径、各补丁是否生效。排查问题先看这个。
@@ -112,6 +115,9 @@ SmartScreen 提示时点「更多信息 → 仍要运行」。
 
 **网页 Usage 显示成 Included 和几十万的小块？**
 是旧版直连流的记账方式。重跑一次 `install` 切回默认的会话流即可，已产生的记录不会改写。
+
+**卸载后还会不会上传真实机器码？**
+不会。`uninstall` 只还原 Sand 功能补丁，机器码伪装会留下。同一台机器重装也继续用同一套假身份。
 
 ## 免责声明
 

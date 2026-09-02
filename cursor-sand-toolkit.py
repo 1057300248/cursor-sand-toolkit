@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -26,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,7 +35,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 TOOL_NAME = "Sand Stream Toolkit"
-TOOL_VERSION = "1.5.4"
+TOOL_VERSION = "1.5.5"
 SUPPORTED_CURSOR_VERSION = "3.18.9"
 CONFIG_VERSION = 1
 STREAM_TRANSPORT_SESSION = "session"
@@ -131,6 +133,45 @@ SUBAGENT_ROUTE_PATCHED = (
 # 这个 flag 由服务端随会话下发，sand/managed-local 拿不到，于是 agent 不知道有哪些
 # MCP server（Context Usage 里 MCP 整类为 0），尽管 exec 已把描述写进 <projectDir>/mcps。
 SAND_MCP_FILESYSTEM_MARKER = "/*SAND_MCP_FILESYSTEM_V1*/"
+# —— 机器码伪装 ——
+# 只改 storage.json 不够：abuseService._getTrueMachineId 会再跑一遍 ioreg / MachineGuid。
+# 必须改 main.js 的 K6（硬件 UUID）、B9e（MAC）、z6（devDeviceId）。
+# kBe 每次启动会用 z6() 覆盖 storage 里的 telemetry.devDeviceId。
+# uninstall 不还原这三处，避免真实机器码再次上传。
+SAND_MACHINE_ID_MARKER = "/*SAND_MACHINE_ID_V1*/"
+SAND_MACHINE_MAC_MARKER = "/*SAND_MACHINE_MAC_V1*/"
+SAND_MACHINE_DEV_MARKER = "/*SAND_MACHINE_DEV_V1*/"
+MACHINE_ID_K6_ORIGINAL = (
+    "async function K6(e){let t=H9e($9e(J6[sR],{timeout:5e3}).toString()),n;"
+    'try{n=(await import("crypto")).createHash("sha256").update(t,"utf8").digest("hex")}'
+    "catch{n=dt()}return e?t:n}"
+)
+MACHINE_MAC_B9E_ORIGINAL = (
+    "function B9e(){const e=F9e();for(const t in e){const n=e[t];if(n){"
+    "for(const{mac:r}of n)if(W9e(r))return r}}"
+    'throw new Error("Unable to retrieve mac address (unexpected format)")}'
+)
+MACHINE_ID_K6_PATCHED_RE = re.compile(
+    r"async function K6\(e\)\{const t=\"[0-9a-fA-F-]{36}\""
+    + re.escape(SAND_MACHINE_ID_MARKER)
+    + r";"
+    r'let n;try\{n=\(await import\("crypto"\)\)\.createHash\("sha256"\)'
+    r'\.update\(t,"utf8"\)\.digest\("hex"\)\}catch\{n=dt\(\)\}return e\?t:n\}'
+)
+MACHINE_MAC_B9E_PATCHED_RE = re.compile(
+    r"function B9e\(\)\{return\"[0-9a-f:]{17}\""
+    + re.escape(SAND_MACHINE_MAC_MARKER)
+    + r"\}"
+)
+MACHINE_DEV_Z6_ORIGINAL = (
+    'async function z6(e){try{return await(await import("@vscode/deviceid")).getDeviceId()}'
+    "catch(t){return e(t),dt()}}"
+)
+MACHINE_DEV_Z6_PATCHED_RE = re.compile(
+    r"async function z6\(e\)\{return\"[0-9a-fA-F-]{36}\""
+    + re.escape(SAND_MACHINE_DEV_MARKER)
+    + r"\}"
+)
 MCP_FILESYSTEM_ORIGINAL = (
     "const t=e.requestContext?.mcpFileSystemOptions,"
     "n=!0===e.featureFlags?.enableMCPFileSystem,"
@@ -371,6 +412,39 @@ class PlannedFile:
     mode: int
 
 
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_MAC_SPOOF_RE = re.compile(
+    r"^02:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}$",
+    re.IGNORECASE,
+)
+_SQM_RE = re.compile(
+    r"^\{[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\}$"
+)
+
+
+@dataclass(frozen=True)
+class SpoofedIdentity:
+    raw_machine_uuid: str
+    machine_id: str
+    mac_address: str
+    mac_machine_id: str
+    dev_device_id: str
+    sqm_id: str
+
+    def to_dict(self) -> Dict[str, str]:
+        return {
+            "rawMachineUuid": self.raw_machine_uuid,
+            "machineId": self.machine_id,
+            "macAddress": self.mac_address,
+            "macMachineId": self.mac_machine_id,
+            "devDeviceId": self.dev_device_id,
+            "sqmId": self.sqm_id,
+        }
+
+
 @dataclass
 class PatchStats:
     is_glass: int = 0
@@ -396,6 +470,9 @@ class PatchStats:
     user_rules: int = 0
     mcp_filesystem: int = 0
     interaction_seq: int = 0
+    machine_id: int = 0
+    machine_mac: int = 0
+    machine_dev: int = 0
 
     @property
     def total(self) -> int:
@@ -422,6 +499,9 @@ class PatchStats:
             + self.user_rules
             + self.mcp_filesystem
             + self.interaction_seq
+            + self.machine_id
+            + self.machine_mac
+            + self.machine_dev
         )
 
 
@@ -498,6 +578,17 @@ class PatchStatus:
     user_rules_markers: int
     mcp_filesystem_markers: int
     interaction_seq_markers: int
+    machine_id_markers: int
+    machine_mac_markers: int
+    machine_dev_markers: int
+
+    @property
+    def machine_id_spoofed(self) -> bool:
+        return (
+            self.machine_id_markers == 1
+            and self.machine_mac_markers == 1
+            and self.machine_dev_markers == 1
+        )
 
     @property
     def installed(self) -> bool:
@@ -984,6 +1075,143 @@ def _load_config() -> Mapping[str, object]:
     return value
 
 
+def _try_load_config() -> Dict[str, object]:
+    try:
+        return dict(_load_config())
+    except SandToolError:
+        return {}
+
+
+def _identity_from_dict(raw: object) -> Optional[SpoofedIdentity]:
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        uuid_s = str(raw["rawMachineUuid"])
+        mac = str(raw["macAddress"]).lower()
+        dev = str(raw["devDeviceId"])
+        sqm = str(raw.get("sqmId") or "")
+    except (KeyError, TypeError):
+        return None
+    if not _UUID_RE.fullmatch(uuid_s) or not _UUID_RE.fullmatch(dev):
+        return None
+    if not _MAC_SPOOF_RE.fullmatch(mac):
+        return None
+    if sqm and not _SQM_RE.fullmatch(sqm):
+        return None
+    return SpoofedIdentity(
+        raw_machine_uuid=uuid_s,
+        machine_id=hashlib.sha256(uuid_s.encode("utf-8")).hexdigest(),
+        mac_address=mac,
+        mac_machine_id=hashlib.sha256(mac.encode("utf-8")).hexdigest(),
+        dev_device_id=dev,
+        sqm_id=sqm,
+    )
+
+
+def _generate_spoofed_identity() -> SpoofedIdentity:
+    raw = str(uuid.uuid4())
+    mac = "02:" + ":".join(f"{secrets.randbelow(256):02x}" for _ in range(5))
+    sqm = "{" + str(uuid.uuid4()).upper() + "}" if sys.platform == "win32" else ""
+    return SpoofedIdentity(
+        raw_machine_uuid=raw,
+        machine_id=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        mac_address=mac,
+        mac_machine_id=hashlib.sha256(mac.encode("utf-8")).hexdigest(),
+        dev_device_id=str(uuid.uuid4()),
+        sqm_id=sqm,
+    )
+
+
+def _load_or_create_spoofed_identity() -> SpoofedIdentity:
+    cfg = _try_load_config()
+    ident = _identity_from_dict(cfg.get("spoofedIdentity"))
+    if ident is not None:
+        return ident
+    ident = _generate_spoofed_identity()
+    payload: Dict[str, object] = {
+        "version": CONFIG_VERSION,
+        "cursorInstallRoot": str(cfg.get("cursorInstallRoot") or ""),
+        "lastVerifiedVersion": str(cfg.get("lastVerifiedVersion") or ""),
+        "spoofedIdentity": ident.to_dict(),
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json_atomic(_config_path(), payload)
+    return ident
+
+
+def _machine_id_k6_patched(raw_uuid: str) -> str:
+    return (
+        f'async function K6(e){{const t="{raw_uuid}"{SAND_MACHINE_ID_MARKER};'
+        'let n;try{n=(await import("crypto")).createHash("sha256").update(t,"utf8").digest("hex")}'
+        "catch{n=dt()}return e?t:n}"
+    )
+
+
+def _machine_mac_b9e_patched(mac: str) -> str:
+    return f'function B9e(){{return"{mac}"{SAND_MACHINE_MAC_MARKER}}}'
+
+
+def _machine_dev_z6_patched(dev_device_id: str) -> str:
+    return f'async function z6(e){{return"{dev_device_id}"{SAND_MACHINE_DEV_MARKER}}}'
+
+
+def _cursor_user_storage_path() -> Path:
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "Cursor" / "User" / "globalStorage" / "storage.json"
+    if sys.platform == "darwin":
+        return (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "Cursor"
+            / "User"
+            / "globalStorage"
+            / "storage.json"
+        )
+    return Path.home() / ".config" / "Cursor" / "User" / "globalStorage" / "storage.json"
+
+
+def apply_spoofed_storage(identity: SpoofedIdentity) -> None:
+    path = _cursor_user_storage_path()
+    data: Dict[str, object] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise SandToolError(f"无法读取 Cursor storage.json：{path}") from exc
+        if isinstance(loaded, dict):
+            data = loaded
+    data["telemetry.machineId"] = identity.machine_id
+    data["telemetry.macMachineId"] = identity.mac_machine_id
+    data["telemetry.devDeviceId"] = identity.dev_device_id
+    data["telemetry.sqmId"] = identity.sqm_id
+    _write_json_atomic(path, data)
+    machineid = path.parent.parent.parent / "machineid"
+    try:
+        _atomic_write(machineid, identity.dev_device_id.encode("utf-8"), 0o600)
+    except OSError:
+        pass
+
+
+def storage_matches_identity(identity: SpoofedIdentity) -> Optional[bool]:
+    path = _cursor_user_storage_path()
+    if not path.exists():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(loaded, dict):
+        return False
+    return (
+        loaded.get("telemetry.machineId") == identity.machine_id
+        and loaded.get("telemetry.macMachineId") == identity.mac_machine_id
+        and loaded.get("telemetry.devDeviceId") == identity.dev_device_id
+        and loaded.get("telemetry.sqmId") == identity.sqm_id
+    )
+
+
 def _read_product(product_path: Path) -> Mapping[str, object]:
     try:
         size = product_path.stat().st_size
@@ -1388,28 +1616,25 @@ def resolve_cursor_layout() -> CursorLayout:
 
 
 def save_cursor_path(value: str) -> Optional[CursorLayout]:
+    existing = _try_load_config()
+    identity = existing.get("spoofedIdentity")
+    payload: Dict[str, object] = {
+        "version": CONFIG_VERSION,
+        "cursorInstallRoot": "",
+        "lastVerifiedVersion": "",
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    if isinstance(identity, dict):
+        payload["spoofedIdentity"] = identity
+
     if value.strip().casefold() in {"auto", "clear", "reset"}:
-        _write_json_atomic(
-            _config_path(),
-            {
-                "version": CONFIG_VERSION,
-                "cursorInstallRoot": "",
-                "lastVerifiedVersion": "",
-                "updatedAt": datetime.now(timezone.utc).isoformat(),
-            },
-        )
+        _write_json_atomic(_config_path(), payload)
         return None
 
     layout = layout_from_path(value)
-    _write_json_atomic(
-        _config_path(),
-        {
-            "version": CONFIG_VERSION,
-            "cursorInstallRoot": str(layout.install_root),
-            "lastVerifiedVersion": layout.version,
-            "updatedAt": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+    payload["cursorInstallRoot"] = str(layout.install_root)
+    payload["lastVerifiedVersion"] = layout.version
+    _write_json_atomic(_config_path(), payload)
     return layout
 
 
@@ -1430,6 +1655,7 @@ def _strip_legacy_rules_skills(content: str) -> Tuple[str, bool, int]:
 def apply_patch_to_content(
     content: str,
     transport: str = STREAM_TRANSPORT_SESSION,
+    identity: Optional[SpoofedIdentity] = None,
 ) -> Tuple[str, PatchStats]:
     transport = _validate_stream_transport(transport)
     stats = PatchStats()
@@ -1670,7 +1896,50 @@ def apply_patch_to_content(
                 count=1,
             )
             stats.interaction_seq += seq_count
+
+    # 机器码伪装（out/main.js）：K6 硬件 UUID、B9e MAC。uninstall 不还原。
+    if SAND_MACHINE_ID_MARKER not in next_content:
+        if next_content.count(MACHINE_ID_K6_ORIGINAL) == 1:
+            ident = identity or _load_or_create_spoofed_identity()
+            next_content = next_content.replace(
+                MACHINE_ID_K6_ORIGINAL,
+                _machine_id_k6_patched(ident.raw_machine_uuid),
+                1,
+            )
+            stats.machine_id += 1
+    if SAND_MACHINE_MAC_MARKER not in next_content:
+        if next_content.count(MACHINE_MAC_B9E_ORIGINAL) == 1:
+            ident = identity or _load_or_create_spoofed_identity()
+            next_content = next_content.replace(
+                MACHINE_MAC_B9E_ORIGINAL,
+                _machine_mac_b9e_patched(ident.mac_address),
+                1,
+            )
+            stats.machine_mac += 1
+    if SAND_MACHINE_DEV_MARKER not in next_content:
+        if next_content.count(MACHINE_DEV_Z6_ORIGINAL) == 1:
+            ident = identity or _load_or_create_spoofed_identity()
+            next_content = next_content.replace(
+                MACHINE_DEV_Z6_ORIGINAL,
+                _machine_dev_z6_patched(ident.dev_device_id),
+                1,
+            )
+            stats.machine_dev += 1
     return next_content, stats
+
+
+def remove_machine_id_from_content(content: str) -> Tuple[str, int]:
+    """显式还原 K6/B9e/z6。普通 uninstall 不调用，避免真实机器码再次上传。"""
+    next_content, k6_count = MACHINE_ID_K6_PATCHED_RE.subn(
+        MACHINE_ID_K6_ORIGINAL, content, count=1
+    )
+    next_content, mac_count = MACHINE_MAC_B9E_PATCHED_RE.subn(
+        MACHINE_MAC_B9E_ORIGINAL, next_content, count=1
+    )
+    next_content, dev_count = MACHINE_DEV_Z6_PATCHED_RE.subn(
+        MACHINE_DEV_Z6_ORIGINAL, next_content, count=1
+    )
+    return next_content, k6_count + mac_count + dev_count
 
 
 def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
@@ -2077,6 +2346,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
     user_rules_markers = 0
     mcp_filesystem_markers = 0
     interaction_seq_markers = 0
+    machine_id_markers = 0
+    machine_mac_markers = 0
+    machine_dev_markers = 0
     legacy_client_markers = 0
     legacy_eligibility_markers = 0
     ide_matches = 0
@@ -2098,6 +2370,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         user_rules_count = content.count(SAND_USER_RULES_MARKER)
         mcp_filesystem_count = content.count(SAND_MCP_FILESYSTEM_MARKER)
         interaction_seq_count = content.count(SAND_INTERACTION_SEQ_MARKER)
+        machine_id_count = content.count(SAND_MACHINE_ID_MARKER)
+        machine_mac_count = content.count(SAND_MACHINE_MAC_MARKER)
+        machine_dev_count = content.count(SAND_MACHINE_DEV_MARKER)
         agent_host_enablement_count = content.count(SAND_AGENT_HOST_ENABLEMENT_MARKER)
         agent_host_identity_count = content.count(SAND_AGENT_HOST_IDENTITY_MARKER)
         move_exec_count = content.count(SAND_MOVE_EXEC_MARKER)
@@ -2159,6 +2434,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
             + user_rules_count
             + mcp_filesystem_count
             + interaction_seq_count
+            + machine_id_count
+            + machine_mac_count
+            + machine_dev_count
         ):
             patched_files.append(target)
         client_markers += client_count
@@ -2174,6 +2452,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         user_rules_markers += user_rules_count
         mcp_filesystem_markers += mcp_filesystem_count
         interaction_seq_markers += interaction_seq_count
+        machine_id_markers += machine_id_count
+        machine_mac_markers += machine_mac_count
+        machine_dev_markers += machine_dev_count
         agent_host_enablement_markers += agent_host_enablement_count
         agent_host_identity_markers += agent_host_identity_count
         move_exec_markers += move_exec_count
@@ -2216,6 +2497,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         user_rules_markers=user_rules_markers,
         mcp_filesystem_markers=mcp_filesystem_markers,
         interaction_seq_markers=interaction_seq_markers,
+        machine_id_markers=machine_id_markers,
+        machine_mac_markers=machine_mac_markers,
+        machine_dev_markers=machine_dev_markers,
     )
 
 
@@ -2748,6 +3032,85 @@ def cmd_rules_skills_check(layout: CursorLayout) -> int:
     return 0
 
 
+def _cursor_main_js(layout: CursorLayout) -> Path:
+    return layout.app_root / "out" / "main.js"
+
+
+def cmd_machine_id_check(layout: CursorLayout) -> int:
+    path = _cursor_main_js(layout)
+    content = _decode_js(path.read_bytes(), path) if path.is_file() else ""
+    k6 = content.count(SAND_MACHINE_ID_MARKER)
+    mac = content.count(SAND_MACHINE_MAC_MARKER)
+    dev = content.count(SAND_MACHINE_DEV_MARKER)
+    ident = _identity_from_dict(_try_load_config().get("spoofedIdentity"))
+    storage = storage_matches_identity(ident) if ident is not None else None
+    print(f"[machine-id] 文件: {path}")
+    if k6 == 1 and mac == 1 and dev == 1:
+        print("[machine-id] 采集函数: 已伪装（K6 + B9e + z6）")
+    elif k6 or mac or dev:
+        print(
+            f"[machine-id] 采集函数: 不完整（K6={k6}, B9e={mac}, z6={dev}），请重新 install"
+        )
+        return 1
+    elif (
+        MACHINE_ID_K6_ORIGINAL in content
+        and MACHINE_MAC_B9E_ORIGINAL in content
+        and MACHINE_DEV_Z6_ORIGINAL in content
+    ):
+        print("[machine-id] 采集函数: 未伪装，仍读真实硬件")
+        return 1
+    else:
+        print("[machine-id] 采集函数: 未匹配到锚点（版本不同？）")
+        return 1
+    if ident is None:
+        print("[machine-id] 假身份: 配置里没有，请重新 install")
+        return 1
+    if storage is None:
+        print("[machine-id] storage.json: 不存在（下次启动会按伪装值写入）")
+    elif storage:
+        print("[machine-id] storage.json: 已与伪装身份同步")
+    else:
+        print("[machine-id] storage.json: 未同步，请重新 install")
+        return 1
+    return 0
+
+
+def cmd_machine_id_restore(layout: CursorLayout) -> int:
+    path = _cursor_main_js(layout)
+    if not path.is_file():
+        print("[machine-id] 错误: 找不到 out/main.js")
+        return 1
+    content = _decode_js(path.read_bytes(), path)
+    if (
+        SAND_MACHINE_ID_MARKER not in content
+        and SAND_MACHINE_MAC_MARKER not in content
+        and SAND_MACHINE_DEV_MARKER not in content
+    ):
+        print("[machine-id] 未打伪装补丁，跳过")
+        return 0
+    close_cursor(layout)
+    next_content, restored = remove_machine_id_from_content(content)
+    expected = sum(
+        1
+        for marker in (
+            SAND_MACHINE_ID_MARKER,
+            SAND_MACHINE_MAC_MARKER,
+            SAND_MACHINE_DEV_MARKER,
+        )
+        if marker in content
+    )
+    if restored != expected:
+        print(
+            f"[machine-id] 错误: 还原数量异常（{restored}/{expected}），拒绝写入"
+        )
+        return 1
+    _atomic_write(path, next_content.encode("utf-8"), stat.S_IMODE(path.stat().st_mode))
+    _sync_checksum_for_target(layout, path)
+    print("[machine-id] 已还原采集函数。下次启动会重新读取并上传真实机器码")
+    start_cursor(layout)
+    return 0
+
+
 def _build_install_plan(
     layout: CursorLayout,
     transport: str = STREAM_TRANSPORT_SESSION,
@@ -2755,10 +3118,11 @@ def _build_install_plan(
     plan: Dict[Path, PlannedFile] = {}
     total = PatchStats()
     transport = _validate_stream_transport(transport)
+    identity = _load_or_create_spoofed_identity()
     for target in layout.target_paths:
         original = _read_planned_file(target)
         content = _decode_js(original.original, target)
-        next_content, stats = apply_patch_to_content(content, transport)
+        next_content, stats = apply_patch_to_content(content, transport, identity)
         if next_content != content:
             plan[target] = PlannedFile(
                 original=original.original,
@@ -2788,6 +3152,9 @@ def _build_install_plan(
         total.user_rules += stats.user_rules
         total.mcp_filesystem += stats.mcp_filesystem
         total.interaction_seq += stats.interaction_seq
+        total.machine_id += stats.machine_id
+        total.machine_mac += stats.machine_mac
+        total.machine_dev += stats.machine_dev
     if plan:
         _update_extension_hashes(layout, plan)
         _sync_product_checksums(layout, plan)
@@ -2855,7 +3222,10 @@ def install(
             before.installed
             and before.stream_mode_installed
             and before.stream_transport == transport
+            and before.machine_id_spoofed
         ):
+            close_cursor(layout)
+            apply_spoofed_storage(_load_or_create_spoofed_identity())
             start_cursor(layout)
             return 0
         raise SandToolError("当前 Cursor 版本未匹配到 Sand 客户端模式规则")
@@ -2884,6 +3254,9 @@ def install(
         or before.user_rules_markers + _stats.user_rules != 1
         or before.mcp_filesystem_markers + _stats.mcp_filesystem != 1
         or before.interaction_seq_markers + _stats.interaction_seq != 1
+        or before.machine_id_markers + _stats.machine_id != 1
+        or before.machine_mac_markers + _stats.machine_mac != 1
+        or before.machine_dev_markers + _stats.machine_dev != 1
     ):
         raise SandToolError(
             "当前 Cursor 版本未完整匹配 Sand Stream 规则："
@@ -2901,7 +3274,10 @@ def install(
             f"rulesSkills={before.rules_skills_markers + _stats.rules_skills}, "
             f"userRules={before.user_rules_markers + _stats.user_rules}, "
             f"mcpFs={before.mcp_filesystem_markers + _stats.mcp_filesystem}, "
-            f"interactionSeq={before.interaction_seq_markers + _stats.interaction_seq}"
+            f"interactionSeq={before.interaction_seq_markers + _stats.interaction_seq}, "
+            f"machineId={before.machine_id_markers + _stats.machine_id}, "
+            f"machineMac={before.machine_mac_markers + _stats.machine_mac}, "
+            f"machineDev={before.machine_dev_markers + _stats.machine_dev}"
         )
 
     close_cursor(layout)
@@ -2925,6 +3301,9 @@ def install(
             or status.user_rules_markers != 1
             or status.mcp_filesystem_markers != 1
             or status.interaction_seq_markers != 1
+            or status.machine_id_markers != 1
+            or status.machine_mac_markers != 1
+            or status.machine_dev_markers != 1
         ):
             raise SandToolError(
                 "安装后状态校验失败："
@@ -2941,12 +3320,16 @@ def install(
                 f"rulesSkillsLegacy={status.rules_skills_legacy_markers}, "
                 f"userRules={status.user_rules_markers}, "
                 f"mcpFs={status.mcp_filesystem_markers}, "
-                f"interactionSeq={status.interaction_seq_markers}"
+                f"interactionSeq={status.interaction_seq_markers}, "
+                f"machineId={status.machine_id_markers}, "
+                f"machineMac={status.machine_mac_markers}, "
+                f"machineDev={status.machine_dev_markers}"
             )
         _verify_extension_hashes(layout, changed_extensions)
         _verify_product_checksums(layout)
 
     _commit_plan(layout, plan, "install", validate)
+    apply_spoofed_storage(_load_or_create_spoofed_identity())
     close_cursor(layout)
     start_cursor(layout)
     return 0
@@ -3024,6 +3407,11 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("ttft-restore", help="还原首字(TTFT)超时优化")
     commands.add_parser("ttft-sync", help="同步 product.json 校验和（修复 corrupt）")
     commands.add_parser("rules-skills-check", help="检查 Rules/Skills 恢复补丁状态")
+    commands.add_parser("machine-id-check", help="检查机器码伪装状态")
+    commands.add_parser(
+        "machine-id-restore",
+        help="还原机器码采集（会重新暴露真实硬件标识，默认不要用）",
+    )
     set_path = commands.add_parser(
         "set-path", help="设置 Cursor 路径；auto 恢复自动检测"
     )
@@ -3093,6 +3481,12 @@ def collect_status_lines() -> List[Tuple[str, str]]:
         )
     elif status.installed:
         lines.append(("[plan-fix] 交互串号修复未启用，请重新 install", ANSI_YELLOW))
+    if status.machine_id_spoofed:
+        lines.append(("[machine-id] 机器码已伪装（uninstall 不会还原）", ANSI_GREEN))
+    elif status.machine_id_markers or status.machine_mac_markers or status.machine_dev_markers:
+        lines.append(("[machine-id] 机器码伪装不完整，请重新 install", ANSI_RED))
+    elif status.installed:
+        lines.append(("[machine-id] 机器码未伪装，请重新 install", ANSI_YELLOW))
     if status.dsv3_legacy_markers:
         lines.append(("[dsv3] 旧版 V1 守卫补丁残留，请重新 install", ANSI_RED))
     elif status.dsv3_local_loop_markers:
@@ -3238,6 +3632,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return cmd_ttft_sync(layout)
         if args.command == "rules-skills-check":
             return cmd_rules_skills_check(layout)
+        if args.command == "machine-id-check":
+            return cmd_machine_id_check(layout)
+        if args.command == "machine-id-restore":
+            return cmd_machine_id_restore(layout)
         raise SandToolError(f"未知命令：{args.command}")
     except PermissionError as exc:
         print_error(f"错误：没有写入权限：{exc}")
