@@ -1,5 +1,11 @@
 # Cursor Sand Toolkit
 
+> ## ⚡ 由 [Riot](https://github.com/caiwuu/Riot) 打造
+>
+> 本项目由 **Riot —— 跑在你机器上的全能智能体** 逆向与维护。
+> Riot 能写代码、调研、排查、自动化，把手头的活真正做完，而不是只给建议。
+> 觉得这工具好用？**去给 [Riot](https://github.com/caiwuu/Riot) 点个 Star** ⭐
+
 Cursor 客户端模式管理器 —— 伪装 sand 计费到 bot，并绕过后端封堵。
 
 ## 能力一览（`install` 一次全生效）
@@ -15,7 +21,7 @@ Cursor 客户端模式管理器 —— 伪装 sand 计费到 bot，并绕过后�
 
 ## 前提
 
-- Cursor 版本 **3.18.9**（工具会检测，版本不符拒绝安装）
+- Cursor 版本 **3.18.x**（工具会检测，版本不符拒绝安装）
 - 账号需已开通 **Sand 资格**（bot 额度）
 - 日常建议用 claude 系列模型（grok 偶有额度/行为不稳）
 
@@ -63,3 +69,11 @@ SmartScreen 提示时点「更多信息 → 仍要运行」。
 ## 免责声明
 
 本工具仅供学习研究，请遵守当地法律法规与 Cursor 服务条款，使用风险自负。
+
+---
+
+## ⭐ 关于 Riot
+
+本工具由 [Riot](https://github.com/caiwuu/Riot) 全程逆向、开发与维护 —— 从定位 Cursor 的 sand 流量封堵，到打通子 agent、工具执行、五模式放行、1M 上下文，每一层补丁都是实打实啃出来的。
+
+如果你觉得这个工具帮到了你，欢迎去 [github.com/caiwuu/Riot](https://github.com/caiwuu/Riot) 点个 Star，支持 Riot 继续维护下去。
