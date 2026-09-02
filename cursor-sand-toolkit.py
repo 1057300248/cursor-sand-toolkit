@@ -101,6 +101,9 @@ SUBAGENT_ROUTE_PATCHED = (
     + '"userMessageAction"!==e.actionCase?"action-not-supported":'
 )
 SAND_MAX_TOKENS_MARKER = "/*SAND_MAX_TOKENS_V1*/"
+SAND_MODE_RELAX_MARKER = "/*SAND_MODE_RELAX_V1*/"
+MODE_RELAX_ORIGINAL = 'e.requestedMode!==oe.xyI.AGENT?"mode-not-supported":'
+MODE_RELAX_PATCHED = '!1?' + SAND_MODE_RELAX_MARKER + '"mode-not-supported":'
 MAX_TOKENS_ORIGINAL = (
     "t.resolveExtendedUsage({inputTokens:n.inputTokens,"
     "outputTokens:n.outputTokens,cacheReadTokens:n.cacheReadTokens,"
@@ -1167,6 +1170,14 @@ def apply_patch_to_content(content: str) -> Tuple[str, PatchStats]:
             )
             stats.subagent_turn += 1
 
+    # 放行所有 Agent 模式（Ask/Plan/Debug/Multitask）走 managed-local（657.js）
+    if SAND_MODE_RELAX_MARKER not in next_content:
+        if MODE_RELAX_ORIGINAL in next_content:
+            next_content = next_content.replace(
+                MODE_RELAX_ORIGINAL, MODE_RELAX_PATCHED, 1
+            )
+            stats.subagent_turn += 1
+
     # 上下文窗口 maxTokens 覆盖（675.js）：后端按默认档返回，用 context 参数覆盖
     if SAND_MAX_TOKENS_MARKER not in next_content:
         if MAX_TOKENS_ORIGINAL in next_content:
@@ -1254,6 +1265,12 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
         if SUBAGENT_ROUTE_PATCHED in next_content:
             next_content = next_content.replace(
                 SUBAGENT_ROUTE_PATCHED, SUBAGENT_ROUTE_ORIGINAL, 1
+            )
+            stats.subagent_turn += 1
+    if SAND_MODE_RELAX_MARKER in next_content:
+        if MODE_RELAX_PATCHED in next_content:
+            next_content = next_content.replace(
+                MODE_RELAX_PATCHED, MODE_RELAX_ORIGINAL, 1
             )
             stats.subagent_turn += 1
     if SUBAGENT_TURN_N_NEW in next_content:
