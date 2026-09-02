@@ -16,7 +16,7 @@ Cursor 客户端模式管理器 —— 伪装 sand 计费到 bot，并绕过后�
 | 会话流（默认）    | 复用官方推理链路，网页 Usage 记到 bot / free                     |
 | 绕过封堵          | 本地推理，绕过后端 sand 流量拒绝                                 |
 | 工具执行          | 恢复 shell / read / glob 等工具                                  |
-| 子 agent（Task）  | 本地子 agent，含后台多任务                                       |
+| 子 agent（Task）  | 本地子 agent，含后台多任务；可选模型跟工作台选择器走               |
 | 五模式放行        | Agent / Ask / Plan / Debug / Multitask 全走本地，含 Plan 的 Build |
 | 1M 上下文         | 恢复上下文窗口与自动压缩                                         |
 | 首字(TTFT)优化    | 每轮固定开销从 ~12s 压到 ~3s                                     |

@@ -35,7 +35,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 TOOL_NAME = "Sand Stream Toolkit"
-TOOL_VERSION = "1.5.6"
+TOOL_VERSION = "1.5.7"
 SUPPORTED_CURSOR_VERSION = "3.18.9"
 CONFIG_VERSION = 1
 STREAM_TRANSPORT_SESSION = "session"
@@ -66,9 +66,12 @@ MOVE_EXEC_ORIGINAL = (
 MOVE_EXEC_PATCHED = "p=!0" + SAND_MOVE_EXEC_MARKER
 # —— 子 agent（Task 工具）激活 ——
 # V1 给了空 Map，Task 提示「无备选模型，只能继承父模型」。
-# V2 填入 grok / composer slug，并带上当前父模型 i。
+# V2 手写 grok / composer slug，漏掉工作台里的 Claude 等系列。
+# V3 把工作台 availableDefaultModels2 灌进 modelsBySlug：install 时烘焙一份，
+#    运行时再用 sqlite3 刷新；过滤规则跟选择器一致，并始终带上父模型 i。
 SAND_TASK_TOOL_MARKER_V1 = "/*SAND_TASK_TOOL_V1*/"
-SAND_TASK_TOOL_MARKER = "/*SAND_TASK_TOOL_V2*/"
+SAND_TASK_TOOL_MARKER_V2 = "/*SAND_TASK_TOOL_V2*/"
+SAND_TASK_TOOL_MARKER = "/*SAND_TASK_TOOL_V3*/"
 TASK_TOOL_ORIGINAL = "taskToolProps:void 0"
 TASK_TOOL_PROPS_PREFIX = (
     "taskToolProps:{parentRequestedModelName:i,parentModelParameters:void 0,"
@@ -89,7 +92,7 @@ TASK_TOOL_PATCHED_V1 = (
     + SAND_TASK_TOOL_MARKER_V1
     + "}"
 )
-TASK_TOOL_PATCHED = (
+TASK_TOOL_PATCHED_V2 = (
     TASK_TOOL_PROPS_PREFIX
     + "subagentModels:{modelsBySlug:(()=>{const e=new Map;"
     'for(const t of[["composer-1.5","composer-1.5"],["composer-2.5","composer-2.5"],'
@@ -97,8 +100,17 @@ TASK_TOOL_PATCHED = (
     '["grok-4-5","grok-4.5"],["grok-4-6","grok-4.6"],[i,i]])'
     'if("string"==typeof t[0]&&t[0])e.set(t[0],{slug:t[1]});return e})()},'
     + TASK_TOOL_PROPS_SUFFIX
-    + SAND_TASK_TOOL_MARKER
+    + SAND_TASK_TOOL_MARKER_V2
     + "}"
+)
+TASK_TOOL_V3_RE = re.compile(
+    re.escape(TASK_TOOL_PROPS_PREFIX)
+    + r".+?"
+    + re.escape(SAND_TASK_TOOL_MARKER + "}")
+)
+APPLICATION_USER_STORAGE_KEY = (
+    "src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl"
+    ".persistentStorage.applicationUser"
 )
 SAND_CLIENT_SIDE_SUBAGENT_MARKER = "/*SAND_CLIENT_SIDE_SUBAGENT_V1*/"
 CLIENT_SIDE_SUBAGENT_ORIGINAL = (
@@ -1195,6 +1207,184 @@ def _cursor_user_storage_path() -> Path:
     return Path.home() / ".config" / "Cursor" / "User" / "globalStorage" / "storage.json"
 
 
+def _cursor_state_vscdb_path() -> Path:
+    return _cursor_user_storage_path().parent / "state.vscdb"
+
+
+def _task_models_cache_path() -> Path:
+    return _config_dir() / "task-models.json"
+
+
+def _task_model_slug_map(data: Mapping[str, object]) -> Dict[str, str]:
+    ai = data.get("aiSettings")
+    settings = ai if isinstance(ai, Mapping) else {}
+    enabled = {
+        item
+        for item in (settings.get("modelOverrideEnabled") or [])
+        if isinstance(item, str)
+    }
+    disabled = {
+        item
+        for item in (settings.get("modelOverrideDisabled") or [])
+        if isinstance(item, str)
+    }
+    mapping: Dict[str, str] = {}
+
+    def add(slug: object, canonical: str) -> None:
+        if isinstance(slug, str) and slug and slug not in mapping:
+            mapping[slug] = canonical
+
+    models = data.get("availableDefaultModels2") or []
+    if not isinstance(models, list):
+        return mapping
+    for raw in models:
+        if not isinstance(raw, Mapping):
+            continue
+        name = raw.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if name in disabled:
+            continue
+        if not raw.get("defaultOn") and name not in enabled:
+            continue
+        if raw.get("onlySupportsCmdK") is True:
+            continue
+        if raw.get("supportsAgent") is False:
+            continue
+        add(name, name)
+        aliases = raw.get("idAliases") or []
+        if isinstance(aliases, list):
+            for alias in aliases:
+                add(alias, name)
+        legacy = raw.get("legacySlugs") or []
+        if isinstance(legacy, list):
+            for slug in legacy:
+                add(slug, slug if isinstance(slug, str) else name)
+        variants = raw.get("variants") or []
+        if isinstance(variants, list):
+            for variant in variants:
+                if isinstance(variant, Mapping):
+                    add(variant.get("legacySlug"), variant.get("legacySlug") or name)
+    return mapping
+
+
+def export_task_model_catalog() -> int:
+    path = _cursor_state_vscdb_path()
+    if not path.is_file():
+        return 0
+    try:
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)
+        try:
+            cur = con.cursor()
+            cur.execute(
+                "SELECT value FROM ItemTable WHERE key=?",
+                (APPLICATION_USER_STORAGE_KEY,),
+            )
+            row = cur.fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return 0
+    if not row or not isinstance(row[0], str):
+        return 0
+    try:
+        data = json.loads(row[0])
+    except Exception:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    slugs = _task_model_slug_map(data)
+    if not slugs:
+        return 0
+    _write_json_atomic(
+        _task_models_cache_path(),
+        {
+            "version": 1,
+            "slugs": slugs,
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return len(slugs)
+
+
+def _load_task_model_slug_map() -> Dict[str, str]:
+    export_task_model_catalog()
+    cache = _task_models_cache_path()
+    if not cache.is_file():
+        return {}
+    try:
+        raw = json.loads(cache.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    slugs = raw.get("slugs") if isinstance(raw, dict) else None
+    if not isinstance(slugs, dict):
+        return {}
+    mapping: Dict[str, str] = {}
+    for key, value in slugs.items():
+        if isinstance(key, str) and key and isinstance(value, str) and value:
+            mapping[key] = value
+    return mapping
+
+
+def _task_tool_models_by_slug_js(slug_map: Mapping[str, str]) -> str:
+    baked = json.dumps(dict(slug_map), ensure_ascii=True, separators=(",", ":"))
+    return (
+        "subagentModels:{modelsBySlug:(()=>{const e=new Map;"
+        'const t=(n,s)=>{if("string"==typeof n&&n)e.set(n,{slug:s||n})};'
+        f"const b={baked};"
+        "for(const n of Object.keys(b))t(n,b[n]);"
+        "try{const n=process.mainModule&&process.mainModule.require;"
+        "if(n){const r=n(\"fs\"),s=n(\"path\"),o=n(\"os\"),a=n(\"child_process\"),"
+        "c=o.homedir(),u=process.platform,"
+        'd="win32"===u?s.join(process.env.APPDATA||s.join(c,"AppData","Roaming"),'
+        '"Cursor","User","globalStorage","state.vscdb"):'
+        '"darwin"===u?s.join(c,"Library","Application Support","Cursor","User",'
+        '"globalStorage","state.vscdb"):'
+        's.join(c,".config","Cursor","User","globalStorage","state.vscdb"),'
+        'l="win32"===u?s.join(process.env.LOCALAPPDATA||s.join(c,"AppData","Local"),'
+        '"SandClientModeStream","sand-client-cli","task-models.json"):'
+        '"darwin"===u?s.join(c,"Library","Application Support",'
+        '"SandClientModeStream","sand-client-cli","task-models.json"):'
+        's.join(c,".config","SandClientModeStream","sand-client-cli","task-models.json"),'
+        "f=p=>{if(!p||\"object\"!=typeof p)return;"
+        "if(p.slugs&&!Array.isArray(p.slugs)){"
+        "for(const n of Object.keys(p.slugs))t(n,p.slugs[n]);return}"
+        "if(Array.isArray(p.slugs)){for(const n of p.slugs)t(n);return}"
+        "const r=p.aiSettings||{},s=new Set(r.modelOverrideEnabled||[]),"
+        "o=new Set(r.modelOverrideDisabled||[]);"
+        "for(const n of p.availableDefaultModels2||[]){"
+        "const a=n&&n.name;"
+        'if("string"!=typeof a||!a||o.has(a)||!n.defaultOn&&!s.has(a)'
+        "||!0===n.onlySupportsCmdK||!1===n.supportsAgent)continue;"
+        "t(a,a);for(const e of n.idAliases||[])t(e,a);"
+        "for(const e of n.legacySlugs||[])t(e,e);"
+        "for(const e of n.variants||[])e&&t(e.legacySlug,e.legacySlug)}};"
+        "let p;try{p=JSON.parse(a.execFileSync(\"sqlite3\","
+        '["-noheader","-cmd",".timeout 3000",d,'
+        "\"SELECT value FROM ItemTable WHERE key='"
+        + APPLICATION_USER_STORAGE_KEY
+        + "'\"],"
+        "{encoding:\"utf8\",maxBuffer:67108864,timeout:8e3,windowsHide:!0}))}"
+        "catch(n){try{p=JSON.parse(r.readFileSync(l,\"utf8\"))}catch(n){}}f(p)}}"
+        "catch(n){}t(i,i);return e})()},"
+    )
+
+
+def build_task_tool_patched(
+    slug_map: Optional[Mapping[str, str]] = None,
+) -> str:
+    mapping = dict(slug_map) if slug_map is not None else _load_task_model_slug_map()
+    return (
+        TASK_TOOL_PROPS_PREFIX
+        + _task_tool_models_by_slug_js(mapping)
+        + TASK_TOOL_PROPS_SUFFIX
+        + SAND_TASK_TOOL_MARKER
+        + "}"
+    )
+
+
 def apply_spoofed_storage(identity: SpoofedIdentity) -> None:
     path = _cursor_user_storage_path()
     data: Dict[str, object] = {}
@@ -1812,17 +2002,35 @@ def apply_patch_to_content(
             stats.move_exec += 1
 
     # 子 agent Task 工具激活（675.js）
-    if SAND_TASK_TOOL_MARKER not in next_content:
-        if TASK_TOOL_PATCHED_V1 in next_content:
-            next_content = next_content.replace(
-                TASK_TOOL_PATCHED_V1, TASK_TOOL_PATCHED, 1
-            )
-            stats.task_tool += 1
-        elif TASK_TOOL_ORIGINAL in next_content:
-            next_content = next_content.replace(
-                TASK_TOOL_ORIGINAL, TASK_TOOL_PATCHED, 1
-            )
-            stats.task_tool += 1
+    needs_task_tool = (
+        TASK_TOOL_ORIGINAL in next_content
+        or TASK_TOOL_PATCHED_V1 in next_content
+        or TASK_TOOL_PATCHED_V2 in next_content
+        or SAND_TASK_TOOL_MARKER in next_content
+    )
+    if needs_task_tool:
+        task_tool_patched = build_task_tool_patched()
+        if task_tool_patched not in next_content:
+            if TASK_TOOL_V3_RE.search(next_content):
+                next_content, replaced = TASK_TOOL_V3_RE.subn(
+                    lambda _match: task_tool_patched, next_content, count=1
+                )
+                stats.task_tool += replaced
+            elif TASK_TOOL_PATCHED_V2 in next_content:
+                next_content = next_content.replace(
+                    TASK_TOOL_PATCHED_V2, task_tool_patched, 1
+                )
+                stats.task_tool += 1
+            elif TASK_TOOL_PATCHED_V1 in next_content:
+                next_content = next_content.replace(
+                    TASK_TOOL_PATCHED_V1, task_tool_patched, 1
+                )
+                stats.task_tool += 1
+            elif TASK_TOOL_ORIGINAL in next_content:
+                next_content = next_content.replace(
+                    TASK_TOOL_ORIGINAL, task_tool_patched, 1
+                )
+                stats.task_tool += 1
 
     # 子 agent 走 client-side 本地路径（675.js）
     if SAND_CLIENT_SIDE_SUBAGENT_MARKER not in next_content:
@@ -2072,9 +2280,14 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
             )
             stats.client_side_subagent += 1
     if SAND_TASK_TOOL_MARKER in next_content:
-        if TASK_TOOL_PATCHED in next_content:
+        next_content, replaced = TASK_TOOL_V3_RE.subn(
+            TASK_TOOL_ORIGINAL, next_content, count=1
+        )
+        stats.task_tool += replaced
+    elif SAND_TASK_TOOL_MARKER_V2 in next_content:
+        if TASK_TOOL_PATCHED_V2 in next_content:
             next_content = next_content.replace(
-                TASK_TOOL_PATCHED, TASK_TOOL_ORIGINAL, 1
+                TASK_TOOL_PATCHED_V2, TASK_TOOL_ORIGINAL, 1
             )
             stats.task_tool += 1
     elif SAND_TASK_TOOL_MARKER_V1 in next_content:
@@ -2410,8 +2623,10 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         agent_host_enablement_count = content.count(SAND_AGENT_HOST_ENABLEMENT_MARKER)
         agent_host_identity_count = content.count(SAND_AGENT_HOST_IDENTITY_MARKER)
         move_exec_count = content.count(SAND_MOVE_EXEC_MARKER)
-        task_tool_count = content.count(SAND_TASK_TOOL_MARKER) + content.count(
-            SAND_TASK_TOOL_MARKER_V1
+        task_tool_count = (
+            content.count(SAND_TASK_TOOL_MARKER)
+            + content.count(SAND_TASK_TOOL_MARKER_V2)
+            + content.count(SAND_TASK_TOOL_MARKER_V1)
         )
         client_side_subagent_count = content.count(SAND_CLIENT_SIDE_SUBAGENT_MARKER)
         subagent_turn_count = (
@@ -3246,6 +3461,7 @@ def install(
             f"本工具仅适配 Cursor {SUPPORTED_CURSOR_VERSION}。"
             "请更换为适配版本后再安装"
         )
+    export_task_model_catalog()
     before = inspect_status(layout)
     if before.external_marker_count:
         raise SandToolError(
