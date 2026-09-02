@@ -4,7 +4,7 @@ build/
 __pycache__/
 *.pyc
 .packenv/
-
+.riot/
 cursor-sand-toolkit.exe
 cursor-sand-toolkit
 
