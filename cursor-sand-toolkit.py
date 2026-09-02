@@ -1,12 +1,12 @@
 """Sand Stream Toolkit。
 
 交互式运行：
-    python cursor-sand-toolkit.py
+    python sand_stream_installer.py
 
 命令行运行：
-    python cursor-sand-toolkit.py install
-    python cursor-sand-toolkit.py uninstall
-    python cursor-sand-toolkit.py set-path <Cursor路径|auto>
+    python sand_stream_installer.py install
+    python sand_stream_installer.py uninstall
+    python sand_stream_installer.py set-path <Cursor路径|auto>
 """
 
 from __future__ import annotations
@@ -32,9 +32,8 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 TOOL_NAME = "Sand Stream Toolkit"
-TOOL_VERSION = "1.5.1"
-SUPPORTED_CURSOR_VERSION = "3.18.x"
-SUPPORTED_VERSION_PREFIX = "3.18."
+TOOL_VERSION = "1.4.0"
+SUPPORTED_CURSOR_VERSION = "3.18.9"
 CONFIG_VERSION = 1
 
 SAND_CLIENT_MARKER = "/*SAND_CLIENT_MODE_V1*/"
@@ -156,7 +155,6 @@ TARGET_SPECS: Tuple[Tuple[str, Optional[str]], ...] = (
     ),
     ("extensions/cursor-agent-host/dist/main.js", "cursor-agent-host"),
     ("extensions/cursor-agent-exec/dist/main.js", "cursor-agent-exec"),
-    ("extensions/cursor-agent-host/dist/61.js", None),
     ("extensions/cursor-agent-host/dist/657.js", None),
     ("extensions/cursor-agent-host/dist/675.js", None),
 )
@@ -312,15 +310,6 @@ class PatchStatus:
         )
 
 
-@dataclass(frozen=True)
-class DirectStreamSymbols:
-    anchor: str
-    provider: str
-    model_resolver: str
-    metadata_resolver: str
-    executor_wrapper: str
-
-
 def _compile_client_rules() -> Tuple[Tuple[str, re.Pattern[str]], ...]:
     marker_guard = rf"(?!{CLIENT_MARKER_GUARD_PATTERN})"
     return (
@@ -373,44 +362,8 @@ AGENT_HOST_IDENTITY_PATCHED = (
     + SAND_AGENT_HOST_IDENTITY_MARKER
     + "}"
 )
-JS_IDENTIFIER_PATTERN = r"[A-Za-z_$][A-Za-z0-9_$]*"
-DIRECT_STREAM_ANCHOR_RE = re.compile(
-    r"function (?P<factory>"
-    + JS_IDENTIFIER_PATTERN
-    + r")\(e\)\{return t=>\{return n=this,o=void 0,s=function\*\(\)\{"
-)
-DIRECT_STREAM_SESSION_RE = re.compile(
-    r"(?P<session>"
-    + JS_IDENTIFIER_PATTERN
-    + r")=function\(e,t\)\{return new (?P<provider>"
-    + JS_IDENTIFIER_PATTERN
-    + r")\(e,t,void 0,void 0\)\}\([^)]*\)\.getSession\(\),(?P<tool>"
-    + JS_IDENTIFIER_PATTERN
-    + r")=\{getExecutor:e=>new (?P<wrapper>"
-    + JS_IDENTIFIER_PATTERN
-    + r")\((?P=session)\.getExecutor\(e\)\)\};return\{promptSession:(?P=session),"
-    r"promptToolSession:(?P=tool),attempt:"
-)
-DIRECT_STREAM_MODEL_RESOLVER_RE = re.compile(
-    r"function (?P<model_resolver>"
-    + JS_IDENTIFIER_PATTERN
-    + r")\(e\)\{return new (?P<namespace>"
-    + JS_IDENTIFIER_PATTERN
-    + r")\."
-    + JS_IDENTIFIER_PATTERN
-    + r"\(\{modelId:e\.modelId,maxMode:e\.maxMode,parameters:e\.parameters\.map\(e=>new "
-    r"(?P=namespace)\."
-    + JS_IDENTIFIER_PATTERN
-    + r"\(\{id:e\.id,value:e\.value\}\)\),builtInModel:e\.builtInModel,"
-    r"isVariantStringRepresentation:e\.isVariantStringRepresentation\}\)\}"
-)
-DIRECT_STREAM_METADATA_RESOLVER_RE = re.compile(
-    r"function (?P<metadata_resolver>"
-    + JS_IDENTIFIER_PATTERN
-    + r")\(e,t\)\{if\(void 0!==e\)return\{promptModelInfo:"
-    + JS_IDENTIFIER_PATTERN
-    + r"\(e,t\),useDsv3Harness:e\.useDsv3Harness,agentTokenLimit:e\.agentTokenLimit,"
-    r"estimatedCacheTtlMs:e\.estimatedCacheTtlMs\}\}"
+DIRECT_STREAM_ANCHOR = (
+    "function hre(e){return t=>{return n=this,o=void 0,s=function*(){"
 )
 AGENT_HOST_ENABLEMENT_RE = re.compile(
     r"(this\._agentHostEnabled=)([A-Za-z_$][A-Za-z0-9_$]*)(,)"
@@ -422,36 +375,7 @@ AGENT_HOST_ENABLEMENT_PATCH_RE = re.compile(
 )
 
 
-def _direct_stream_symbols(content: str) -> Optional[DirectStreamSymbols]:
-    anchors = tuple(DIRECT_STREAM_ANCHOR_RE.finditer(content))
-    if not anchors:
-        return None
-    if len(anchors) != 1:
-        raise SandToolError(f"直连 Stream 入口匹配不唯一：{len(anchors)}")
-
-    rules = (
-        (DIRECT_STREAM_SESSION_RE, "会话构造器"),
-        (DIRECT_STREAM_MODEL_RESOLVER_RE, "模型转换器"),
-        (DIRECT_STREAM_METADATA_RESOLVER_RE, "模型元数据转换器"),
-    )
-    matches: List[re.Match[str]] = []
-    for rule, label in rules:
-        found = tuple(rule.finditer(content))
-        if len(found) != 1:
-            raise SandToolError(f"直连 Stream {label}匹配数量异常：{len(found)}")
-        matches.append(found[0])
-
-    session_match, model_match, metadata_match = matches
-    return DirectStreamSymbols(
-        anchor=anchors[0].group(0),
-        provider=session_match.group("provider"),
-        model_resolver=model_match.group("model_resolver"),
-        metadata_resolver=metadata_match.group("metadata_resolver"),
-        executor_wrapper=session_match.group("wrapper"),
-    )
-
-
-def _direct_stream_injection(symbols: DirectStreamSymbols) -> str:
+def _direct_stream_injection() -> str:
     return (
         "{"
         + SAND_DIRECT_STREAM_MARKER
@@ -459,12 +383,8 @@ def _direct_stream_injection(symbols: DirectStreamSymbols) -> str:
         'if(void 0===n)throw new Error("Sand direct Stream requires requestedModel");'
         'const o=String(n.modelId||""),i=o.toLowerCase(),'
         'r=new Map(n.parameters.map(e=>[e.id,e.value])),'
-        "s=new "
-        + symbols.provider
-        + "(e,n,void 0,void 0).getSession(),"
-        "p={getExecutor:e=>new "
-        + symbols.executor_wrapper
-        + "(s.getExecutor(e))},"
+        's=new Joe(e,n,void 0,void 0).getSession(),'
+        'p={getExecutor:e=>new RK(s.getExecutor(e))},'
         'a={vendor:i.includes("grok")?"xai":i.includes("gemini")?"gemini":'
         'i.includes("claude")||i.includes("opus")||i.includes("sonnet")||i.includes("fable")?'
         '"anthropic":i.includes("gpt")||i.includes("codex")?"openai":"unknown",'
@@ -486,13 +406,9 @@ def _direct_stream_injection(symbols: DirectStreamSymbols) -> str:
         'isGpt53Codex:i.includes("gpt-5.3-codex"),'
         'isGpt52Codex:i.includes("gpt-5.2-codex"),'
         'isCodexFamily:i.includes("codex"),isGpt5Family:i.includes("gpt-5")};'
-        "return{promptSession:s,promptToolSession:p,attempt:{resolvedModel:"
-        + symbols.model_resolver
-        + "(n),"
+        'return{promptSession:s,promptToolSession:p,attempt:{resolvedModel:cre(n),'
         'supportsSelfSummary:!1,routedModelDisplayName:o,'
-        "resolvedModelMetadata:"
-        + symbols.metadata_resolver
-        + "(a,o),finish:()=>Promise.resolve()}}}"
+        'resolvedModelMetadata:nre(a,o),finish:()=>Promise.resolve()}}}'
     )
 
 def _platform_name() -> str:
@@ -1183,15 +1099,14 @@ def apply_patch_to_content(content: str) -> Tuple[str, PatchStats]:
         )
         stats.agent_host_identity += identity_count
 
-    if SAND_DIRECT_STREAM_MARKER not in next_content:
-        direct_symbols = _direct_stream_symbols(next_content)
-    else:
-        direct_symbols = None
-    if direct_symbols is not None:
-        direct_injection = _direct_stream_injection(direct_symbols)
+    direct_injection = _direct_stream_injection()
+    if (
+        SAND_DIRECT_STREAM_MARKER not in next_content
+        and DIRECT_STREAM_ANCHOR in next_content
+    ):
         next_content = next_content.replace(
-            direct_symbols.anchor,
-            direct_symbols.anchor + direct_injection,
+            DIRECT_STREAM_ANCHOR,
+            DIRECT_STREAM_ANCHOR + direct_injection,
             1,
         )
         stats.direct_stream += 1
@@ -1330,18 +1245,11 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
         )
         stats.agent_host_identity += identity_count
 
-    if SAND_DIRECT_STREAM_MARKER in next_content:
-        direct_symbols = _direct_stream_symbols(next_content)
-        if direct_symbols is None:
-            raise SandToolError("无法定位已安装的直连 Stream 入口")
-        direct_injection = _direct_stream_injection(direct_symbols)
-        direct_count = next_content.count(direct_injection)
-        if direct_count != 1:
-            raise SandToolError(
-                f"已安装的直连 Stream 补丁匹配数量异常：{direct_count}"
-            )
-        next_content = next_content.replace(direct_injection, "", 1)
-        stats.direct_stream += 1
+    direct_injection = _direct_stream_injection()
+    direct_count = next_content.count(direct_injection)
+    if direct_count:
+        next_content = next_content.replace(direct_injection, "")
+        stats.direct_stream += direct_count
 
     next_content, agent_host_count = AGENT_HOST_ENABLEMENT_PATCH_RE.subn(
         lambda match: match.group(2) + match.group(1) + match.group(3),
@@ -2110,7 +2018,7 @@ def _build_uninstall_plan(
 
 
 def install(layout: CursorLayout) -> int:
-    if not layout.version.startswith(SUPPORTED_VERSION_PREFIX):
+    if layout.version != SUPPORTED_CURSOR_VERSION:
         raise SandToolError(
             f"当前 Cursor 版本为 {layout.version}，"
             f"本工具仅适配 Cursor {SUPPORTED_CURSOR_VERSION}。"
@@ -2235,11 +2143,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
-            "  python cursor-sand-toolkit.py install\n"
-            "  python cursor-sand-toolkit.py uninstall\n"
-            "  python cursor-sand-toolkit.py set-path \"E:\\Development\\IDE\\cursor\"\n"
-            "  python3 cursor-sand-toolkit.py set-path /Applications/Cursor.app\n"
-            "  python cursor-sand-toolkit.py set-path auto"
+            "  python sand_stream_installer.py install\n"
+            "  python sand_stream_installer.py uninstall\n"
+            "  python sand_stream_installer.py set-path \"E:\\Development\\IDE\\cursor\"\n"
+            "  python3 sand_stream_installer.py set-path /Applications/Cursor.app\n"
+            "  python sand_stream_installer.py set-path auto"
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {TOOL_VERSION}")
@@ -2266,9 +2174,9 @@ def collect_status_lines() -> List[Tuple[str, str]]:
 
     lines: List[Tuple[str, str]] = [
         (f"[环境] Cursor {layout.version}  |  {layout.install_root}", ANSI_BLUE),
-        (f"[适配] 支持 Cursor {SUPPORTED_CURSOR_VERSION}", ANSI_GREEN),
+        (f"[适配] 仅支持 Cursor {SUPPORTED_CURSOR_VERSION}", ANSI_GREEN),
     ]
-    if not layout.version.startswith(SUPPORTED_VERSION_PREFIX):
+    if layout.version != SUPPORTED_CURSOR_VERSION:
         lines.append(
             (
                 f"[警告] 当前版本 {layout.version} 不受支持，请勿安装",
