@@ -35,7 +35,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 TOOL_NAME = "Sand Stream Toolkit"
-TOOL_VERSION = "1.5.5"
+TOOL_VERSION = "1.5.6"
 SUPPORTED_CURSOR_VERSION = "3.18.9"
 CONFIG_VERSION = 1
 STREAM_TRANSPORT_SESSION = "session"
@@ -65,17 +65,40 @@ MOVE_EXEC_ORIGINAL = (
 )
 MOVE_EXEC_PATCHED = "p=!0" + SAND_MOVE_EXEC_MARKER
 # —— 子 agent（Task 工具）激活 ——
-SAND_TASK_TOOL_MARKER = "/*SAND_TASK_TOOL_V1*/"
+# V1 给了空 Map，Task 提示「无备选模型，只能继承父模型」。
+# V2 填入 grok / composer slug，并带上当前父模型 i。
+SAND_TASK_TOOL_MARKER_V1 = "/*SAND_TASK_TOOL_V1*/"
+SAND_TASK_TOOL_MARKER = "/*SAND_TASK_TOOL_V2*/"
 TASK_TOOL_ORIGINAL = "taskToolProps:void 0"
-TASK_TOOL_PATCHED = (
+TASK_TOOL_PROPS_PREFIX = (
     "taskToolProps:{parentRequestedModelName:i,parentModelParameters:void 0,"
     "parentMaxMode:l,isModelBlocked:()=>!1,isModelValid:()=>!0,"
     "requiresMaxMode:()=>!1,forceModelId:void 0,compareModelCosts:()=>0,"
     'subagentModelForcePolicy:"none",requireServerSideSubagent:!1,'
-    "subagentModels:{modelsBySlug:new Map},subagentModelOverrides:{},"
+)
+TASK_TOOL_PROPS_SUFFIX = (
+    "subagentModelOverrides:{},"
     "normalizeCustomSubagents:e=>e,enableGrindSwarmSubagent:!1,"
     "enableBrowserSubagent:!1,"
-    "getTaskToolConfig:()=>async()=>({})" + SAND_TASK_TOOL_MARKER + "}"
+    "getTaskToolConfig:()=>async()=>({})"
+)
+TASK_TOOL_PATCHED_V1 = (
+    TASK_TOOL_PROPS_PREFIX
+    + "subagentModels:{modelsBySlug:new Map},"
+    + TASK_TOOL_PROPS_SUFFIX
+    + SAND_TASK_TOOL_MARKER_V1
+    + "}"
+)
+TASK_TOOL_PATCHED = (
+    TASK_TOOL_PROPS_PREFIX
+    + "subagentModels:{modelsBySlug:(()=>{const e=new Map;"
+    'for(const t of[["composer-1.5","composer-1.5"],["composer-2.5","composer-2.5"],'
+    '["grok","grok-4.6"],["grok-4.5","grok-4.5"],["grok-4.6","grok-4.6"],'
+    '["grok-4-5","grok-4.5"],["grok-4-6","grok-4.6"],[i,i]])'
+    'if("string"==typeof t[0]&&t[0])e.set(t[0],{slug:t[1]});return e})()},'
+    + TASK_TOOL_PROPS_SUFFIX
+    + SAND_TASK_TOOL_MARKER
+    + "}"
 )
 SAND_CLIENT_SIDE_SUBAGENT_MARKER = "/*SAND_CLIENT_SIDE_SUBAGENT_V1*/"
 CLIENT_SIDE_SUBAGENT_ORIGINAL = (
@@ -1790,7 +1813,12 @@ def apply_patch_to_content(
 
     # 子 agent Task 工具激活（675.js）
     if SAND_TASK_TOOL_MARKER not in next_content:
-        if TASK_TOOL_ORIGINAL in next_content:
+        if TASK_TOOL_PATCHED_V1 in next_content:
+            next_content = next_content.replace(
+                TASK_TOOL_PATCHED_V1, TASK_TOOL_PATCHED, 1
+            )
+            stats.task_tool += 1
+        elif TASK_TOOL_ORIGINAL in next_content:
             next_content = next_content.replace(
                 TASK_TOOL_ORIGINAL, TASK_TOOL_PATCHED, 1
             )
@@ -2047,6 +2075,12 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
         if TASK_TOOL_PATCHED in next_content:
             next_content = next_content.replace(
                 TASK_TOOL_PATCHED, TASK_TOOL_ORIGINAL, 1
+            )
+            stats.task_tool += 1
+    elif SAND_TASK_TOOL_MARKER_V1 in next_content:
+        if TASK_TOOL_PATCHED_V1 in next_content:
+            next_content = next_content.replace(
+                TASK_TOOL_PATCHED_V1, TASK_TOOL_ORIGINAL, 1
             )
             stats.task_tool += 1
     if SAND_MAX_TOKENS_MARKER in next_content:
@@ -2376,7 +2410,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         agent_host_enablement_count = content.count(SAND_AGENT_HOST_ENABLEMENT_MARKER)
         agent_host_identity_count = content.count(SAND_AGENT_HOST_IDENTITY_MARKER)
         move_exec_count = content.count(SAND_MOVE_EXEC_MARKER)
-        task_tool_count = content.count(SAND_TASK_TOOL_MARKER)
+        task_tool_count = content.count(SAND_TASK_TOOL_MARKER) + content.count(
+            SAND_TASK_TOOL_MARKER_V1
+        )
         client_side_subagent_count = content.count(SAND_CLIENT_SIDE_SUBAGENT_MARKER)
         subagent_turn_count = (
             content.count(SAND_SUBAGENT_TURN_MARKER)
