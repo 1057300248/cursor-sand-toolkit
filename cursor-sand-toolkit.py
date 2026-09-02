@@ -32,8 +32,9 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 TOOL_NAME = "Sand Stream Toolkit"
-TOOL_VERSION = "1.4.0"
-SUPPORTED_CURSOR_VERSION = "3.18.9"
+TOOL_VERSION = "1.5.0"
+SUPPORTED_CURSOR_VERSION = "3.18.x"
+SUPPORTED_VERSION_PREFIX = "3.18."
 CONFIG_VERSION = 1
 
 SAND_CLIENT_MARKER = "/*SAND_CLIENT_MODE_V1*/"
@@ -2018,7 +2019,7 @@ def _build_uninstall_plan(
 
 
 def install(layout: CursorLayout) -> int:
-    if layout.version != SUPPORTED_CURSOR_VERSION:
+    if not layout.version.startswith(SUPPORTED_VERSION_PREFIX):
         raise SandToolError(
             f"当前 Cursor 版本为 {layout.version}，"
             f"本工具仅适配 Cursor {SUPPORTED_CURSOR_VERSION}。"
@@ -2174,9 +2175,9 @@ def collect_status_lines() -> List[Tuple[str, str]]:
 
     lines: List[Tuple[str, str]] = [
         (f"[环境] Cursor {layout.version}  |  {layout.install_root}", ANSI_BLUE),
-        (f"[适配] 仅支持 Cursor {SUPPORTED_CURSOR_VERSION}", ANSI_GREEN),
+        (f"[适配] 支持 Cursor {SUPPORTED_CURSOR_VERSION}", ANSI_GREEN),
     ]
-    if layout.version != SUPPORTED_CURSOR_VERSION:
+    if not layout.version.startswith(SUPPORTED_VERSION_PREFIX):
         lines.append(
             (
                 f"[警告] 当前版本 {layout.version} 不受支持，请勿安装",
