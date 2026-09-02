@@ -1,6 +1,6 @@
 # Cursor Sand Toolkit
 
-> ## ⚡ 由 [Riot](https://github.com/caiwuu/Riot) 打造
+> ## ⚡ 由 [Riot](https://github.com/caiwuu/Riot) 打造。
 >
 > 本项目由 **Riot —— 跑在你机器上的全能智能体** 逆向与维护。
 > Riot 能写代码、调研、排查、自动化，把手头的活真正做完，而不是只给建议。
