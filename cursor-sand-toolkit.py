@@ -35,7 +35,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 TOOL_NAME = "Sand Stream Toolkit"
-TOOL_VERSION = "1.5.7"
+TOOL_VERSION = "1.5.8"
 SUPPORTED_CURSOR_VERSION = "3.18.9"
 CONFIG_VERSION = 1
 STREAM_TRANSPORT_SESSION = "session"
@@ -238,10 +238,18 @@ MAX_TOKENS_PATCHED = (
     "return num*mult})()})" + SAND_MAX_TOKENS_MARKER
 )
 # —— 首字(TTFT)延迟优化：buildFromPushedData 等待 pushed rules 的内置超时 10s → 1s ——
-# 不同版本 minify 后的超时常量名不同：3.18.25 用 yCd，3.18.9 用 Ykd；值均为 1e4
+# 常量名每次 minify 都不同（3.18.25 是 yCd，3.18.9 desktop 是 Ykd、glass 是 v$p），
+# 改用紧邻的 "[push_req_context]" 字面量定位，desktop 与 glass 两份 bundle 都能命中。
 SAND_TTFT_MARKER = "/*SAND_TTFT_V1*/"
 TTFT_TIMEOUT_VARS = ("yCd", "Ykd")
 TTFT_ORIGINALS = tuple(f"{var}=1e4" for var in TTFT_TIMEOUT_VARS)
+TTFT_ORIGINAL_RE = re.compile(
+    r"(\"\[push_req_context\]\",[A-Za-z_$][A-Za-z0-9_$]*=)1e4"
+)
+TTFT_PATCHED_RE = re.compile(
+    r"\"\[push_req_context\]\",[A-Za-z_$][A-Za-z0-9_$]*=1e3"
+    + re.escape(SAND_TTFT_MARKER)
+)
 TTFT_RESTORE_RE = re.compile(
     rf"([A-Za-z_$][A-Za-z0-9_$]*)=1e3{re.escape(SAND_TTFT_MARKER)}"
 )
@@ -314,14 +322,19 @@ JS_IDENTIFIER_PATTERN = r"[A-Za-z_$][A-Za-z0-9_$]*"
 # workbench 的 injectLocalModeNonFileRules 只在 localMode 才把 knowledgeBase 里的
 # User Rules 并进 requestContext.rules，于是 Context Usage 里 Rules 恒为 0。
 # 打掉这个守卫，让 buildFromPushedData 始终注入（sand 全走本地，不会与服务端重复）。
+# 形参名与 flags 对象名逐 bundle 不同（desktop 是 (e)/fl，glass 是 (t)/oc），都不写死。
 SAND_USER_RULES_MARKER = "/*SAND_USER_RULES_V1*/"
 USER_RULES_ORIGINAL_RE = re.compile(
-    r"injectLocalModeNonFileRules\(e\)\{if\(!(?P<flags>"
+    r"injectLocalModeNonFileRules\((?P<arg>"
+    + JS_IDENTIFIER_PATTERN
+    + r")\)\{if\(!(?P<flags>"
     + JS_IDENTIFIER_PATTERN
     + r")\.localMode\)return;"
 )
 USER_RULES_PATCHED_RE = re.compile(
-    r"injectLocalModeNonFileRules\(e\)\{if\(!1&&!(?P<flags>"
+    r"injectLocalModeNonFileRules\((?P<arg>"
+    + JS_IDENTIFIER_PATTERN
+    + r")\)\{if\(!1&&!(?P<flags>"
     + JS_IDENTIFIER_PATTERN
     + r")\.localMode\)return;"
     + re.escape(SAND_USER_RULES_MARKER)
@@ -383,6 +396,78 @@ ELIGIBILITY_MARKER_PATTERN = re.escape(SAND_ELIGIBILITY_MARKER)
 LEGACY_CLIENT_MARKER_PATTERN = re.escape(LEGACY_SAND_CLIENT_MARKER)
 LEGACY_ELIGIBILITY_MARKER_PATTERN = re.escape(LEGACY_SAND_ELIGIBILITY_MARKER)
 CLIENT_MARKER_GUARD_PATTERN = r"/\*[A-Z0-9_]*SAND_CLIENT(?:_(?:MODE|EXISTING))?_V1\*/"
+# —— Agent Window（glass）客户端类型 ——
+# getDesktopBackendClientType() 是 `isGlass?"glass":"ide"`。CLIENT_RULES 只改 else 分支，
+# 主窗口（isGlass=false）拿到 sand，Agent Window（isGlass=true）仍报 "glass"：
+# 路由已被 657.js 固定成 managed-local，客户端类型却不是 sand，后端直接拒 → Agent Window 不可用。
+# 这里把 glass 分支也改成 sand；保留三元结构，卸载时才能原样还原出 else 分支。
+SAND_CLIENT_GLASS_MARKER = "/*SAND_CLIENT_GLASS_V1*/"
+JS_MEMBER_PATTERN = r"[A-Za-z_$][A-Za-z0-9_$.]*"
+CLIENT_GLASS_ORIGINAL_RE = re.compile(
+    r"(getDesktopBackendClientType\(\)\{return "
+    + JS_MEMBER_PATTERN
+    + r"\.isGlass\?)([\"'])glass\2"
+)
+CLIENT_GLASS_PATCHED_RE = re.compile(
+    r"(getDesktopBackendClientType\(\)\{return "
+    + JS_MEMBER_PATTERN
+    + r"\.isGlass\?)([\"'])sand\2"
+    + re.escape(SAND_CLIENT_GLASS_MARKER)
+)
+# —— Agent Window 的 x-cursor-client-layout ——
+# clientLayoutTag = isGlass?"glass":unifiedAgent?"unifiedAgent":"editor"。
+# 即便 client-type 已是 sand，Agent Window 仍带 layout=glass，服务端把它算进
+# 「Other Models」额度：主窗口（editor）能跑 Opus，Agent Window 同一模型同一账号
+# 却回 "Other Models usage limit reached"，被强制降级到 grok-4.6。
+# 只改 setCommonHeaders 里喂给 layout tag 的 isGlass，不动 CURSOR_LAYOUT 环境变量
+# 和扩展宿主 initData，避免影响 Agent Window 自身的布局行为。
+SAND_CLIENT_LAYOUT_MARKER = "/*SAND_CLIENT_LAYOUT_V1*/"
+CLIENT_LAYOUT_ORIGINAL_RE = re.compile(
+    r"(setCommonHeaders\([A-Za-z_$][\w$]*\)\{const [A-Za-z_$][\w$]*="
+    r"[A-Za-z_$][\w$]*\(\{isGlass:)this\.environmentService\.isGlass\?\?!1,"
+)
+CLIENT_LAYOUT_PATCHED_RE = re.compile(
+    r"(setCommonHeaders\([A-Za-z_$][\w$]*\)\{const [A-Za-z_$][\w$]*="
+    r"[A-Za-z_$][\w$]*\(\{isGlass:)!1"
+    + re.escape(SAND_CLIENT_LAYOUT_MARKER)
+    + r","
+)
+# —— 扩展宿主自己的请求头 ——
+# agent 请求不走渲染进程的 setCommonHeaders，而是扩展宿主的
+# getAllRequestHeadersExceptAccessToken，那里各自又算了一遍：
+#   clientType : n.environment.isGlass?"glass":"ide"
+#   clientLayout: n.environment.isGlass?"glass":tag==="unifiedAgent"?"unifiedAgent":"editor"
+# CLIENT_RULES 同样只改到 else 分支，于是 Agent Window 的 agent 请求依旧带
+# client-type=glass，服务端按普通账号计费 → "Other Models usage limit reached"。
+# 这里把 isGlass 判定短路成假，两个字段一起回落到非 glass 分支；保留原表达式，
+# 卸载时只需去掉 `&&!1`。node 与 web worker 两个宿主各一处。
+CLIENT_GLASS_EXTHOST_TYPE_RE = re.compile(
+    r"(clientType:[A-Za-z_$][\w$]*\.environment\.isGlass)"
+    r"(\?[\"']glass[\"']:)"
+)
+CLIENT_GLASS_EXTHOST_TYPE_PATCHED_RE = re.compile(
+    r"(clientType:[A-Za-z_$][\w$]*\.environment\.isGlass)&&!1"
+    + re.escape(SAND_CLIENT_GLASS_MARKER)
+)
+CLIENT_LAYOUT_EXTHOST_RE = re.compile(
+    r"([A-Za-z_$][\w$]*\.environment\.isGlass)"
+    r"(\?[\"']glass[\"']:[A-Za-z_$][\w$]*===[\"']unifiedAgent[\"'])"
+)
+CLIENT_LAYOUT_EXTHOST_PATCHED_RE = re.compile(
+    r"([A-Za-z_$][\w$]*\.environment\.isGlass)&&!1"
+    + re.escape(SAND_CLIENT_LAYOUT_MARKER)
+    + r"(?=\?[\"']glass[\"']:[A-Za-z_$][\w$]*===[\"']unifiedAgent[\"'])"
+)
+# getServerConfig 是客户端唯一显式上报 aiserver.v1.ClientSurface（EDITOR=1/GLASS=2）的地方，
+# 服务端据此下发各 surface 的配置与额度策略。Agent Window 报 GLASS，一并改成 EDITOR。
+SAND_CLIENT_SURFACE_MARKER = "/*SAND_CLIENT_SURFACE_V1*/"
+CLIENT_SURFACE_ORIGINAL_RE = re.compile(
+    r"clientSurface:this\.workbenchEnvironmentService\.isGlass===!0\?"
+    r"([A-Za-z_$][\w$]*)\.GLASS:\1\.EDITOR"
+)
+CLIENT_SURFACE_PATCHED_RE = re.compile(
+    r"clientSurface:([A-Za-z_$][\w$]*)\.EDITOR" + re.escape(SAND_CLIENT_SURFACE_MARKER)
+)
 ELIGIBILITY_MARKER_GUARD_PATTERN = r"/\*[A-Z0-9_]*SAND_ELIGIBILITY(?:_MODE)?_V1\*/"
 SAND_ONBOARDING_URL = "https://cursor.com/bot/onboarding?product=grok-bot"
 
@@ -485,6 +570,9 @@ class PatchStats:
     is_glass: int = 0
     object_header: int = 0
     set_header: int = 0
+    client_glass: int = 0
+    client_layout: int = 0
+    client_surface: int = 0
     eligibility: int = 0
     adopted_sand: int = 0
     migrated_client: int = 0
@@ -515,6 +603,9 @@ class PatchStats:
             self.is_glass
             + self.object_header
             + self.set_header
+            + self.client_glass
+            + self.client_layout
+            + self.client_surface
             + self.eligibility
             + self.migrated_client
             + self.migrated_eligibility
@@ -543,6 +634,9 @@ class PatchStats:
 @dataclass
 class RemoveStats:
     client_type: int = 0
+    client_glass: int = 0
+    client_layout: int = 0
+    client_surface: int = 0
     eligibility: int = 0
     managed_local_route: int = 0
     local_runtime_load: int = 0
@@ -565,6 +659,9 @@ class RemoveStats:
     def total(self) -> int:
         return (
             self.client_type
+            + self.client_glass
+            + self.client_layout
+            + self.client_surface
             + self.eligibility
             + self.managed_local_route
             + self.local_runtime_load
@@ -616,6 +713,17 @@ class PatchStatus:
     machine_id_markers: int
     machine_mac_markers: int
     machine_dev_markers: int
+    client_glass_markers: int
+    client_layout_markers: int
+    client_surface_markers: int
+
+    @property
+    def agent_window_ready(self) -> bool:
+        return (
+            self.client_glass_markers == 4
+            and self.client_layout_markers == 4
+            and self.client_surface_markers == 2
+        )
 
     @property
     def machine_id_spoofed(self) -> bool:
@@ -629,6 +737,9 @@ class PatchStatus:
     def installed(self) -> bool:
         return (
             self.client_markers
+            + self.client_glass_markers
+            + self.client_layout_markers
+            + self.client_surface_markers
             + self.eligibility_markers
             + self.legacy_client_markers
             + self.legacy_eligibility_markers
@@ -1898,6 +2009,45 @@ def apply_patch_to_content(
 
         next_content = rule.sub(replace_client, next_content)
 
+    # Agent Window（glass）：getDesktopBackendClientType 的 isGlass 分支也返回 sand
+    next_content, client_glass_count = CLIENT_GLASS_ORIGINAL_RE.subn(
+        lambda match: (
+            match.group(1)
+            + match.group(2)
+            + "sand"
+            + match.group(2)
+            + SAND_CLIENT_GLASS_MARKER
+        ),
+        next_content,
+    )
+    next_content, exthost_type_count = CLIENT_GLASS_EXTHOST_TYPE_RE.subn(
+        lambda match: (
+            match.group(1) + "&&!1" + SAND_CLIENT_GLASS_MARKER + match.group(2)
+        ),
+        next_content,
+    )
+    stats.client_glass += client_glass_count + exthost_type_count
+
+    # Agent Window：x-cursor-client-layout 报 editor，别被算进 Other Models 额度
+    next_content, client_layout_count = CLIENT_LAYOUT_ORIGINAL_RE.subn(
+        lambda match: match.group(1) + "!1" + SAND_CLIENT_LAYOUT_MARKER + ",",
+        next_content,
+    )
+    next_content, exthost_layout_count = CLIENT_LAYOUT_EXTHOST_RE.subn(
+        lambda match: (
+            match.group(1) + "&&!1" + SAND_CLIENT_LAYOUT_MARKER + match.group(2)
+        ),
+        next_content,
+    )
+    stats.client_layout += client_layout_count + exthost_layout_count
+    next_content, client_surface_count = CLIENT_SURFACE_ORIGINAL_RE.subn(
+        lambda match: (
+            "clientSurface:" + match.group(1) + ".EDITOR" + SAND_CLIENT_SURFACE_MARKER
+        ),
+        next_content,
+    )
+    stats.client_surface += client_surface_count
+
     for prefix in ELIGIBILITY_PREFIXES:
         count = next_content.count(prefix)
         if count == 0:
@@ -2078,15 +2228,16 @@ def apply_patch_to_content(
             )
             stats.task_tool += 1
 
-    # 首字(TTFT)延迟优化（workbench.desktop.main.js）：buildFromPushedData
-    # 等待 pushed rules 的超时 10s → 1s。多版本锚点 yCd(3.18.25)/Ykd(3.18.9)。
+    # 首字(TTFT)延迟优化（desktop / glass 两份 workbench）：buildFromPushedData
+    # 等待 pushed rules 的超时 10s → 1s。按 "[push_req_context]" 定位，不认混淆名。
     if SAND_TTFT_MARKER not in next_content:
-        for original in TTFT_ORIGINALS:
-            if next_content.count(original) == 1:
-                patched_text = original.replace("=1e4", "=1e3") + SAND_TTFT_MARKER
-                next_content = next_content.replace(original, patched_text, 1)
-                stats.ttft += 1
-                break
+        if len(TTFT_ORIGINAL_RE.findall(next_content)) == 1:
+            next_content, ttft_count = TTFT_ORIGINAL_RE.subn(
+                lambda match: match.group(1) + "1e3" + SAND_TTFT_MARKER,
+                next_content,
+                count=1,
+            )
+            stats.ttft += ttft_count
 
     # Rules/Skills 恢复（cursor-agent-exec/dist/main.js）：host 启用时 aa() 跳过 na()。
     # 先剥掉 host 侧 V1–V3 旧注入，再改 aa() 补调 na()。
@@ -2098,13 +2249,15 @@ def apply_patch_to_content(
             )
             stats.rules_skills += 1
 
-    # User Rules 注入（workbench.desktop.main.js）：injectLocalModeNonFileRules 去掉
+    # User Rules 注入（desktop / glass 两份 workbench）：injectLocalModeNonFileRules 去掉
     # localMode 守卫，managed-local 也把 Settings 里的 User/Team rules 并进 requestContext。
     if SAND_USER_RULES_MARKER not in next_content:
         if len(USER_RULES_ORIGINAL_RE.findall(next_content)) == 1:
             next_content, user_rules_count = USER_RULES_ORIGINAL_RE.subn(
                 lambda match: (
-                    "injectLocalModeNonFileRules(e){if(!1&&!"
+                    "injectLocalModeNonFileRules("
+                    + match.group("arg")
+                    + "){if(!1&&!"
                     + match.group("flags")
                     + ".localMode)return;"
                     + SAND_USER_RULES_MARKER
@@ -2190,6 +2343,35 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
     legacy_eligibility_count = next_content.count(legacy_eligibility)
     next_content = next_content.replace(legacy_eligibility, "")
     stats.eligibility += legacy_eligibility_count
+    # Agent Window：先还原 isGlass 分支，再交给下面通用的 sand → ide 规则处理 else 分支
+    next_content, client_glass_count = CLIENT_GLASS_PATCHED_RE.subn(
+        lambda match: match.group(1) + match.group(2) + "glass" + match.group(2),
+        next_content,
+    )
+    next_content, exthost_type_count = CLIENT_GLASS_EXTHOST_TYPE_PATCHED_RE.subn(
+        lambda match: match.group(1), next_content
+    )
+    stats.client_glass += client_glass_count + exthost_type_count
+    next_content, exthost_layout_count = CLIENT_LAYOUT_EXTHOST_PATCHED_RE.subn(
+        lambda match: match.group(1), next_content
+    )
+    stats.client_layout += exthost_layout_count
+    next_content, client_layout_count = CLIENT_LAYOUT_PATCHED_RE.subn(
+        lambda match: match.group(1) + "this.environmentService.isGlass??!1,",
+        next_content,
+    )
+    stats.client_layout += client_layout_count
+    next_content, client_surface_count = CLIENT_SURFACE_PATCHED_RE.subn(
+        lambda match: (
+            "clientSurface:this.workbenchEnvironmentService.isGlass===!0?"
+            + match.group(1)
+            + ".GLASS:"
+            + match.group(1)
+            + ".EDITOR"
+        ),
+        next_content,
+    )
+    stats.client_surface += client_surface_count
     client_re = re.compile(rf"([\"'])sand\1{CLIENT_MARKER_PATTERN}")
     existing_re = re.compile(rf"([\"'])sand\1{CLIENT_EXISTING_MARKER_PATTERN}")
 
@@ -2320,7 +2502,9 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
     if SAND_USER_RULES_MARKER in next_content:
         next_content, user_rules_count = USER_RULES_PATCHED_RE.subn(
             lambda match: (
-                "injectLocalModeNonFileRules(e){if(!"
+                "injectLocalModeNonFileRules("
+                + match.group("arg")
+                + "){if(!"
                 + match.group("flags")
                 + ".localMode)return;"
             ),
@@ -2596,6 +2780,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
     machine_id_markers = 0
     machine_mac_markers = 0
     machine_dev_markers = 0
+    client_glass_markers = 0
+    client_layout_markers = 0
+    client_surface_markers = 0
     legacy_client_markers = 0
     legacy_eligibility_markers = 0
     ide_matches = 0
@@ -2607,6 +2794,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         client_count = content.count(SAND_CLIENT_MARKER) + content.count(
             SAND_CLIENT_EXISTING_MARKER
         )
+        client_glass_count = content.count(SAND_CLIENT_GLASS_MARKER)
+        client_layout_count = content.count(SAND_CLIENT_LAYOUT_MARKER)
+        client_surface_count = content.count(SAND_CLIENT_SURFACE_MARKER)
         eligibility_count = content.count(SAND_ELIGIBILITY_MARKER)
         managed_local_route_count = content.count(SAND_MANAGED_LOCAL_ROUTE_MARKER)
         local_runtime_load_count = content.count(SAND_LOCAL_RUNTIME_LOAD_MARKER)
@@ -2664,6 +2854,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         )
         if (
             client_count
+            + client_glass_count
+            + client_layout_count
+            + client_surface_count
             + eligibility_count
             + legacy_client_count
             + legacy_eligibility_count
@@ -2691,6 +2884,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         ):
             patched_files.append(target)
         client_markers += client_count
+        client_glass_markers += client_glass_count
+        client_layout_markers += client_layout_count
+        client_surface_markers += client_surface_count
         eligibility_markers += eligibility_count
         legacy_client_markers += legacy_client_count
         legacy_eligibility_markers += legacy_eligibility_count
@@ -2751,6 +2947,9 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         machine_id_markers=machine_id_markers,
         machine_mac_markers=machine_mac_markers,
         machine_dev_markers=machine_dev_markers,
+        client_glass_markers=client_glass_markers,
+        client_layout_markers=client_layout_markers,
+        client_surface_markers=client_surface_markers,
     )
 
 
@@ -3119,8 +3318,8 @@ def ttft_state(layout: CursorLayout) -> Tuple[bool, bool, int]:
     content = _decode_js(path.read_bytes(), path)
     return (
         SAND_TTFT_MARKER in content,
-        any(original in content for original in TTFT_ORIGINALS),
-        sum(content.count(original) for original in TTFT_ORIGINALS),
+        TTFT_ORIGINAL_RE.search(content) is not None,
+        len(TTFT_ORIGINAL_RE.findall(content)),
     )
 
 
@@ -3207,12 +3406,12 @@ def cmd_ttft_apply(layout: CursorLayout) -> int:
     path = _ttft_workbench_js(layout)
     close_cursor(layout)
     content = _decode_js(path.read_bytes(), path)
-    matched = next(o for o in TTFT_ORIGINALS if o in content)
-    patched_text = matched.replace("=1e4", "=1e3") + SAND_TTFT_MARKER
-    content = content.replace(matched, patched_text, 1)
+    content, _applied = TTFT_ORIGINAL_RE.subn(
+        lambda match: match.group(1) + "1e3" + SAND_TTFT_MARKER, content, count=1
+    )
     _atomic_write(path, content.encode("utf-8"), stat.S_IMODE(path.stat().st_mode))
     _sync_checksum_for_target(layout, path)
-    print(f"[ttft] 补丁完成: 首字超时已从 10s 改为 1s（锚点 {matched}）")
+    print("[ttft] 补丁完成: 首字超时已从 10s 改为 1s")
     start_cursor(layout)
     return 0
 
@@ -3383,6 +3582,9 @@ def _build_install_plan(
         total.is_glass += stats.is_glass
         total.object_header += stats.object_header
         total.set_header += stats.set_header
+        total.client_glass += stats.client_glass
+        total.client_layout += stats.client_layout
+        total.client_surface += stats.client_surface
         total.eligibility += stats.eligibility
         total.adopted_sand += stats.adopted_sand
         total.migrated_client += stats.migrated_client
@@ -3501,14 +3703,17 @@ def install(
         or direct_after != expect_direct
         or before.dsv3_local_loop_markers + _stats.dsv3_local_loop != 1
         or (before.agent_host_enablement_markers + _stats.agent_host_enablement != 2)
-        or before.ttft_markers + _stats.ttft != 1
+        or before.ttft_markers + _stats.ttft != 2
         or before.rules_skills_markers + _stats.rules_skills != 1
-        or before.user_rules_markers + _stats.user_rules != 1
+        or before.user_rules_markers + _stats.user_rules != 2
         or before.mcp_filesystem_markers + _stats.mcp_filesystem != 1
         or before.interaction_seq_markers + _stats.interaction_seq != 1
         or before.machine_id_markers + _stats.machine_id != 1
         or before.machine_mac_markers + _stats.machine_mac != 1
         or before.machine_dev_markers + _stats.machine_dev != 1
+        or before.client_glass_markers + _stats.client_glass != 4
+        or before.client_layout_markers + _stats.client_layout != 4
+        or before.client_surface_markers + _stats.client_surface != 2
     ):
         raise SandToolError(
             "当前 Cursor 版本未完整匹配 Sand Stream 规则："
@@ -3529,7 +3734,10 @@ def install(
             f"interactionSeq={before.interaction_seq_markers + _stats.interaction_seq}, "
             f"machineId={before.machine_id_markers + _stats.machine_id}, "
             f"machineMac={before.machine_mac_markers + _stats.machine_mac}, "
-            f"machineDev={before.machine_dev_markers + _stats.machine_dev}"
+            f"machineDev={before.machine_dev_markers + _stats.machine_dev}, "
+            f"agentWindow={before.client_glass_markers + _stats.client_glass}, "
+            f"clientLayout={before.client_layout_markers + _stats.client_layout}, "
+            f"clientSurface={before.client_surface_markers + _stats.client_surface}"
         )
 
     close_cursor(layout)
@@ -3547,10 +3755,11 @@ def install(
             or status.legacy_eligibility_markers != 0
             or status.dsv3_local_loop_markers != 1
             or status.dsv3_legacy_markers != 0
-            or status.ttft_markers != 1
+            or status.ttft_markers != 2
             or status.rules_skills_markers != 1
             or status.rules_skills_legacy_markers != 0
-            or status.user_rules_markers != 1
+            or status.user_rules_markers != 2
+            or not status.agent_window_ready
             or status.mcp_filesystem_markers != 1
             or status.interaction_seq_markers != 1
             or status.machine_id_markers != 1
@@ -3575,7 +3784,10 @@ def install(
                 f"interactionSeq={status.interaction_seq_markers}, "
                 f"machineId={status.machine_id_markers}, "
                 f"machineMac={status.machine_mac_markers}, "
-                f"machineDev={status.machine_dev_markers}"
+                f"machineDev={status.machine_dev_markers}, "
+                f"agentWindow={status.client_glass_markers}, "
+                f"clientLayout={status.client_layout_markers}, "
+                f"clientSurface={status.client_surface_markers}"
             )
         _verify_extension_hashes(layout, changed_extensions)
         _verify_product_checksums(layout)
@@ -3704,6 +3916,20 @@ def collect_status_lines() -> List[Tuple[str, str]]:
         lines.append(("[move-exec] 工具执行补丁已启用", ANSI_GREEN))
     elif status.installed:
         lines.append(("[move-exec] 工具执行补丁未启用", ANSI_YELLOW))
+    if status.agent_window_ready:
+        lines.append(
+            ("[agent-window] Agent Window 已伪装为 sand + editor 布局", ANSI_GREEN)
+        )
+    elif (
+        status.client_glass_markers
+        or status.client_layout_markers
+        or status.client_surface_markers
+    ):
+        lines.append(("[agent-window] Agent Window 补丁不完整，请重新 install", ANSI_RED))
+    elif status.installed:
+        lines.append(
+            ("[agent-window] Agent Window 仍是原版，无法使用，请重新 install", ANSI_YELLOW)
+        )
     ttft_patched, ttft_original, _ttft_count = ttft_state(layout)
     if ttft_patched:
         lines.append(("[ttft] 首字超时已 1s（已补丁）", ANSI_GREEN))
