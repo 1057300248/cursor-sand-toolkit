@@ -3,6 +3,8 @@ name: build-cursor-sand-toolkit
 on:
   workflow_dispatch: {}
   push:
+    branches:
+      - "refactor/engineering-v1.6.0"
     tags:
       - "v*"
 
