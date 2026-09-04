@@ -36,7 +36,15 @@ jobs:
         run: python -m pytest
 
       - name: Build single-file binary
-        run: pyinstaller --onefile --name cursor-sand-toolkit cursor-sand-toolkit.py
+        run: >-
+          pyinstaller --onefile --collect-submodules cursor_sand_core
+          --name cursor-sand-toolkit cursor-sand-toolkit.py
+
+      - name: Smoke-test packaged binary
+        run: >-
+          python -c "import os, subprocess;
+          p='dist/cursor-sand-toolkit.exe' if os.name == 'nt' else 'dist/cursor-sand-toolkit';
+          subprocess.run([p, '--version'], check=True)"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
