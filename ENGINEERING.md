@@ -1,61 +1,85 @@
 # Engineering v1.6
 
-This branch introduces a maintainability layer without changing the existing `main` runtime path.
+Version 1.6 moves the executable entrypoint and engineering services into a package while preserving the 1.5.8 executor as an unchanged compatibility runtime.
 
-## Goals
+## Runtime layout
 
-- Separate patch orchestration from feature-specific patch definitions.
-- Detect builds by file fingerprints instead of relying on a single version string.
-- Make file updates transactional and recoverable.
-- Add structured, read-only diagnostics with machine-readable output.
-- Require regression tests before future patch modules are migrated.
+```text
+cursor-sand-toolkit.py
+        |
+        v
+cursor_sand_core.cli
+   |-- version / doctor / inventory   -> v1.6 modules
+   `-- existing commands              -> compat.run_legacy()
+                                             |
+                                             v
+                                  legacy_runtime.py (frozen 1.5.8)
+```
 
-## Current modules
+The root script is now only a thin launcher. New engineering work no longer needs to grow the historical single-file entrypoint.
 
-- `cursor_sand_core/patching.py`: generic `PatchSpec` model, state inspection, apply/restore flow.
+## Modules
+
+- `cursor_sand_core/cli.py`: unified 1.6 command router.
+- `cursor_sand_core/compat.py`: narrow adapter into the frozen 1.5.8 executor.
+- `cursor_sand_core/legacy_runtime.py`: byte-equivalent copy of the former 1.5.8 root runtime.
+- `cursor_sand_core/version.py`: canonical package/version metadata.
+- `cursor_sand_core/patching.py`: generic `PatchSpec` model, state inspection and apply/restore flow.
 - `cursor_sand_core/profiles.py`: SHA-256 build fingerprints and profile matching.
 - `cursor_sand_core/transaction.py`: atomic multi-file staging with rollback on commit failure.
-- `cursor_sand_core/doctor.py`: generic `PatchSpec` health reporting.
+- `cursor_sand_core/doctor.py`: generic patch-health reporting.
 - `cursor_sand_core/marker_doctor.py`: read-only marker diagnostics for existing installations.
-- `cursor_sand_core/catalog.py`: known diagnostic features and their target files.
+- `cursor_sand_core/catalog.py`: known diagnostic features and target files.
 - `cursor_sand_core/inventory.py`: target-file size and SHA-256 inventory.
-- `cursor_sand_core/doctor_cli.py`: text/JSON command-line diagnostics.
+- `cursor_sand_core/doctor_cli.py`: text/JSON diagnostics command.
+- `cursor_sand_core/inventory_cli.py`: bundle fingerprint command.
 
-## Doctor
+## Unified CLI
 
-Install the development package:
+Install the package for development:
 
 ```bash
 python -m pip install -e .
 ```
 
-Inspect a Cursor `resources/app` directory:
+Version information:
 
 ```bash
-cursor-sand-doctor /path/to/Cursor/resources/app
+cursor-sand-toolkit --version
+python -m cursor_sand_core --version
 ```
 
-Machine-readable output:
+Read-only diagnostics:
 
 ```bash
-cursor-sand-doctor /path/to/Cursor/resources/app --json
+cursor-sand-toolkit doctor /path/to/Cursor/resources/app
+cursor-sand-toolkit doctor /path/to/Cursor/resources/app --json
+cursor-sand-toolkit doctor /path/to/Cursor/resources/app --strict
 ```
 
-Strict mode returns exit code `1` if any known diagnostic feature is not healthy:
+Bundle fingerprints:
 
 ```bash
-cursor-sand-doctor /path/to/Cursor/resources/app --strict
+cursor-sand-toolkit inventory /path/to/Cursor/resources/app
+cursor-sand-toolkit inventory /path/to/Cursor/resources/app --json
 ```
 
-The doctor is read-only. It fingerprints known bundles and reports marker state; it never modifies the Cursor installation.
+Existing 1.5.8 commands are forwarded without rewriting their implementation.
 
-## Migration rule
+## Compatibility contract
 
-Existing behavior in `cursor-sand-toolkit.py` remains untouched in this engineering phase. Feature-specific modification logic should be migrated one module at a time only after a fixture/regression test exists for that feature.
+The compatibility runtime is deliberately frozen. New 1.6 code may change routing, diagnostics, packaging, build detection, testing and transaction infrastructure, but the historical executor is not auto-formatted or behaviorally rewritten as part of this migration.
+
+This gives the branch a stable transition path:
+
+1. the executable and package architecture are already 1.6;
+2. existing commands keep their prior implementation;
+3. future feature migrations can be performed one at a time behind regression tests;
+4. the root script never needs to become a monolith again.
 
 ## Required regression contract
 
-Every migrated patch should have tests for:
+Every newly migrated patch module should have tests for:
 
 1. original -> patched
 2. second apply is idempotent
@@ -64,15 +88,24 @@ Every migrated patch should have tests for:
 5. missing anchor is reported instead of silently modified
 6. transaction rollback preserves original bytes on failure
 
-## CI
+The compatibility router itself is tested to ensure old command arguments are passed through unchanged.
+
+## CI and release
 
 `.github/workflows/quality.yml` provides:
 
-- one dedicated Ruff/compile/CLI smoke-test job on Python 3.12;
-- Pytest on Python 3.10 and 3.12;
-- Linux, Windows and macOS test coverage;
-- `fail-fast: false` so all platform failures are visible in one run.
+- Ruff for new 1.6 modules (the frozen legacy runtime is excluded from reformatting);
+- compile checks including the compatibility runtime;
+- unified CLI and module-entrypoint smoke tests;
+- Pytest on Python 3.10 and 3.12 across Linux, Windows and macOS.
+
+`.github/workflows/build.yml` additionally:
+
+- runs the regression suite before packaging;
+- explicitly collects all `cursor_sand_core` submodules in PyInstaller;
+- smoke-tests the packaged executable with `--version`;
+- publishes SHA-256 checksums for release archives.
 
 ## Safety boundary
 
-The engineering core is intentionally generic. It improves maintainability, diagnostics, testing, fingerprinting and transactional file handling; it does not add or strengthen service-limit, billing or abuse-control bypass behavior.
+The 1.6 engineering work improves structure, diagnostics, testing, fingerprinting, packaging and transactional file handling. It does not add or strengthen service-limit, billing or abuse-control bypass behavior.
