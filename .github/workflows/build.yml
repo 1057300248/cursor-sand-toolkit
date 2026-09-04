@@ -3,8 +3,6 @@ name: build-cursor-sand-toolkit
 on:
   workflow_dispatch: {}
   push:
-    branches:
-      - "refactor/engineering-v1.6.0"
     tags:
       - "v*"
 
@@ -58,7 +56,7 @@ jobs:
           if-no-files-found: warn
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/refactor/engineering-v1.6.0'
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -81,10 +79,6 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v1.6.0-engineering' }}
-          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v1.6.0 Engineering Preview' }}
-          target_commitish: ${{ github.sha }}
-          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
           files: |
             artifacts/*.zip
             artifacts/SHA256SUMS.txt
