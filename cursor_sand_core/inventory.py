@@ -5,7 +5,6 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-
 DEFAULT_TARGETS: tuple[str, ...] = (
     "out/main.js",
     "out/vs/workbench/api/worker/extensionHostWorkerMain.js",
