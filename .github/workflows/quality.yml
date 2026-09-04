@@ -8,8 +8,25 @@ on:
       - "refactor/**"
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dev dependencies
+        run: python -m pip install -e .[dev]
+      - name: Ruff
+        run: python -m ruff check cursor_sand_core tests
+      - name: Compile package
+        run: python -m compileall -q cursor_sand_core
+      - name: Doctor CLI smoke test
+        run: cursor-sand-doctor --help
+
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.10", "3.12"]
@@ -21,7 +38,5 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install dev dependencies
         run: python -m pip install -e .[dev]
-      - name: Ruff
-        run: python -m ruff check cursor_sand_core tests
       - name: Pytest
         run: python -m pytest
