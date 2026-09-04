@@ -1,7 +1,8 @@
-"""Reusable engineering primitives for Cursor Sand Toolkit.
+"""Cursor Sand Toolkit 1.6 engineering package.
 
-This package intentionally contains no service-bypass policy. It provides generic
-version fingerprinting, patch orchestration, diagnostics and transactional writes.
+New code lives in focused modules for command routing, diagnostics, fingerprints,
+patch orchestration and transactional file updates. The unchanged 1.5.8 executor
+is retained as a compatibility runtime while migration proceeds feature by feature.
 """
 
 from .doctor import DoctorReport, inspect_installation
@@ -19,6 +20,9 @@ from .marker_doctor import (
 from .patching import PatchResult, PatchSpec, PatchState, apply_patch, inspect_patch
 from .profiles import BuildProfile, Fingerprint, ProfileMatch, match_profile
 from .transaction import FileTransaction, TransactionError
+from .version import LEGACY_RUNTIME_VERSION, TOOL_NAME, VERSION
+
+__version__ = VERSION
 
 __all__ = [
     "BuildProfile",
@@ -26,6 +30,7 @@ __all__ = [
     "FileTransaction",
     "Fingerprint",
     "InventoryItem",
+    "LEGACY_RUNTIME_VERSION",
     "MarkerDoctorReport",
     "MarkerFeature",
     "MarkerFeatureResult",
@@ -36,7 +41,9 @@ __all__ = [
     "PatchSpec",
     "PatchState",
     "ProfileMatch",
+    "TOOL_NAME",
     "TransactionError",
+    "VERSION",
     "apply_patch",
     "inspect_installation",
     "inspect_marker_feature",
