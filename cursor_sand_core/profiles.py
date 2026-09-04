@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
 
 @dataclass(frozen=True)
@@ -12,7 +12,7 @@ class Fingerprint:
     sha256: str
 
     @classmethod
-    def from_file(cls, root: Path, relative_path: str) -> "Fingerprint":
+    def from_file(cls, root: Path, relative_path: str) -> Fingerprint:
         data = (root / relative_path).read_bytes()
         return cls(relative_path, hashlib.sha256(data).hexdigest())
 
