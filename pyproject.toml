@@ -3,13 +3,14 @@ requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cursor-sand-toolkit-core"
-version = "1.6.0.dev0"
-description = "Engineering core for version profiles, patch orchestration, diagnostics and transactional file updates."
+name = "cursor-sand-toolkit"
+version = "1.6.0"
+description = "Cursor Sand Toolkit with modular diagnostics, build profiles and compatibility runtime."
 requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
+cursor-sand-toolkit = "cursor_sand_core.cli:entrypoint"
 cursor-sand-doctor = "cursor_sand_core.doctor_cli:main"
 
 [project.optional-dependencies]
