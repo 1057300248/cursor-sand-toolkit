@@ -1,0 +1,3 @@
+TOOL_NAME = "Sand Stream Toolkit"
+VERSION = "1.6.0"
+LEGACY_RUNTIME_VERSION = "1.5.8"
