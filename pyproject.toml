@@ -9,6 +9,9 @@ description = "Engineering core for version profiles, patch orchestration, diagn
 requires-python = ">=3.10"
 dependencies = []
 
+[project.scripts]
+cursor-sand-doctor = "cursor_sand_core.doctor_cli:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.3",
