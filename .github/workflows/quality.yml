@@ -44,3 +44,20 @@ jobs:
         run: python -m pip install -e .[dev]
       - name: Pytest
         run: python -m pytest
+
+  package-smoke:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install packaging dependencies
+        run: python -m pip install pyinstaller -e .
+      - name: Build one-file executable
+        run: >-
+          pyinstaller --onefile --collect-submodules cursor_sand_core
+          --name cursor-sand-toolkit cursor-sand-toolkit.py
+      - name: Smoke-test packaged runtime
+        run: ./dist/cursor-sand-toolkit --version
