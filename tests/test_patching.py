@@ -1,4 +1,10 @@
-from cursor_sand_core.patching import PatchSpec, PatchState, apply_patch, inspect_patch, restore_patch
+from cursor_sand_core.patching import (
+    PatchSpec,
+    PatchState,
+    apply_patch,
+    inspect_patch,
+    restore_patch,
+)
 
 
 def _spec() -> PatchSpec:
