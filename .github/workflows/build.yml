@@ -29,12 +29,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PyInstaller
-        run: pip install pyinstaller
+      - name: Install build and test dependencies
+        run: python -m pip install pyinstaller -e .[dev]
+
+      - name: Run regression tests
+        run: python -m pytest
 
       - name: Build single-file binary
-        run: |
-          pyinstaller --onefile --name cursor-sand-toolkit cursor-sand-toolkit.py
+        run: pyinstaller --onefile --name cursor-sand-toolkit cursor-sand-toolkit.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -55,7 +57,7 @@ jobs:
         with:
           path: artifacts
 
-      - name: Package artifacts
+      - name: Package artifacts and checksums
         run: |
           set -e
           cd artifacts
@@ -63,10 +65,13 @@ jobs:
             name="${d%/}"
             (cd "$d" && zip -r "../${name}.zip" .)
           done
-          ls -la
+          sha256sum *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.zip
+          files: |
+            artifacts/*.zip
+            artifacts/SHA256SUMS.txt
           generate_release_notes: true
