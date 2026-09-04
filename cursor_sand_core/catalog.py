@@ -1,6 +1,5 @@
 from .marker_doctor import MarkerFeature, MarkerRequirement
 
-
 WORKBENCH_DESKTOP = "out/vs/workbench/workbench.desktop.main.js"
 WORKBENCH_GLASS = "out/vs/workbench/workbench.glass.main.js"
 AGENT_EXEC = "extensions/cursor-agent-exec/dist/main.js"
